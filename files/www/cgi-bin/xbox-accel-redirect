@@ -19,8 +19,8 @@ assets1.xboxlive.com | assets2.xboxlive.com | d1.xboxlive.com | d2.xboxlive.com 
 esac
 
 uri=$REQUEST_URI
-# 不允许请求 URI 中的原始 CR/LF 进入响应头。
-if [ "$(printf '%s' "$uri" | LC_ALL=C tr -d '[:cntrl:]')" != "$uri" ]; then
+# 八进制范围兼容 BusyBox tr，拦截 C0 / DEL（含原始 CR/LF）。
+if [ "$(printf '%s' "$uri" | LC_ALL=C tr -d '\000-\037\177')" != "$uri" ]; then
 	printf 'Status: 400 Bad Request\r\nContent-Length: 0\r\n\r\n'
 	exit 0
 fi

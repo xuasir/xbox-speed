@@ -35,6 +35,9 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(data.getmember('./etc/config/xbox-accel').mode, 0o600)
                 self.assertEqual(data.getmember('./www/luci-static/resources/view/xbox-accel/overview.js').mode, 0o644)
                 self.assertIn(f'VERSION={ver}\n', data.extractfile('./usr/bin/xbox-accel').read().decode())
+                for module in ('diagnostics', 'verification', 'application', 'privacy', 'quick-check'):
+                    self.assertIsNotNone(data.extractfile(f'./usr/share/xbox-accel/{module}.sh'))
+                    self.assertEqual(data.getmember(f'./usr/share/xbox-accel/{module}.sh').mode, 0o644)
             self.assertEqual(result['channel'], 'stable')
             self.assertEqual(len(result['assets']), 5)
 

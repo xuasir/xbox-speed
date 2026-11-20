@@ -1,6 +1,8 @@
 config main 'main'
 	# 总开关。建议用 xbox-accel enable / disable 切换
 	option enabled '0'
+	# 开机恢复已启用的功能；关闭后仍执行启动清理，不自动运行测速
+	option autostart '1'
 
 	# 国内下载域名（*.xboxlive.cn）指向最快节点
 	option optimize_cn '1'
@@ -15,7 +17,13 @@ config main 'main'
 	# 选了运营商后，会额外询问该运营商其他地区的节点来扩大候选范围
 	option isp 'auto'
 
-	# 测速与健康检查的定时
+	# 完整测速：daily / weekly / monthly，使用路由器系统时区
+	option schedule_type 'daily'
+	option schedule_time '05:15'
+	option schedule_weekday '0'
+	# 29..31 号在没有该日期的月份跳过
+	option schedule_monthday '1'
+	# 旧版 cron 保留兼容；schedule_type 缺失或为 legacy 时使用
 	option cron '15 5 * * *'
 	option health_interval '10'
 
@@ -36,6 +44,7 @@ config main 'main'
 	list fallback_dns '223.5.5.5'
 	list fallback_dns '119.29.29.29'
 
-	# 把候选与选中节点加入 Passwall 直连集合；规则变化时自动重启 Passwall
+	# 把候选与选中节点加入 Passwall 直连集合；启用时自动重载新增规则
+	# 撤销功能时始终重载已识别副本并清理旧规则
 	option passwall_direct '1'
 	option passwall_restart '1'

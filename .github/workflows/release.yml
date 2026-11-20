@@ -51,6 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           sh -n files/usr/bin/xbox-accel
+          for library in files/usr/share/xbox-accel/*.sh; do sh -n "$library"; done
           sh -n files/etc/init.d/xbox-accel
           sh -n files/usr/libexec/rpcd/xbox-accel
           sh -n install.sh
@@ -59,6 +60,9 @@ jobs:
           python3 tests/test_build_ipk.py
           python3 tests/test_publish_release.py
           python3 tests/test_cgi.py
+          python3 tests/test_diagnostics.py
+          python3 tests/test_dns_cleanup.py
+          python3 tests/test_schedule_startup.py
           node tests/test_luci.js
 
       - name: Resolve beta or stable version

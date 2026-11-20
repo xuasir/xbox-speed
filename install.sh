@@ -16,6 +16,11 @@ FILES="
 /usr/share/xbox-accel/ecs.telecom
 /usr/share/xbox-accel/ecs.unicom
 /usr/share/xbox-accel/ecs.mobile
+/usr/share/xbox-accel/diagnostics.sh
+/usr/share/xbox-accel/verification.sh
+/usr/share/xbox-accel/application.sh
+/usr/share/xbox-accel/privacy.sh
+/usr/share/xbox-accel/quick-check.sh
 /usr/libexec/rpcd/xbox-accel
 /usr/share/luci/menu.d/luci-app-xbox-accel.json
 /usr/share/rpcd/acl.d/luci-app-xbox-accel.json
