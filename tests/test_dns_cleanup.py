@@ -53,6 +53,38 @@ class DNSCleanupTests(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             return p.stdout
 
+    def resolver_helpers(self, *names):
+        return process_helpers() + '\n' + '\n'.join(
+            function(name).replace('/proc/', 'proc/') for name in
+            ('resolver_process', 'resolver_pids', 'resolver_running') + names)
+
+    def test_resolver_discovery_uses_process_identity_with_missing_or_wrong_pid(self):
+        def fixture(root):
+            process_fixture(root, 51, 'unrelated.conf')
+            process_fixture(root, 52, 'resolver.conf', name='renamed-resolver')
+            process_fixture(root, 53, 'resolver.conf', binary=b'other-program')
+        output = self.run_shell('''
+RESOLVER_CONF=$PWD/resolver.conf; RUN_DIR=run; mkdir run
+''' + self.resolver_helpers() + '''
+resolver_pids
+echo 51 > run/dnsmasq.pid
+resolver_pids
+resolver_running; echo running:$?
+''', fixture)
+        self.assertEqual(output.splitlines(), ['52', '52', 'running:0'])
+
+    def test_stop_resolver_signals_only_verified_instance(self):
+        def fixture(root):
+            process_fixture(root, 51, 'unrelated.conf')
+            process_fixture(root, 52, 'resolver.conf', name='renamed-resolver')
+            process_fixture(root, 53, 'resolver.conf', binary=b'other-program')
+        output = self.run_shell('''
+RESOLVER_CONF=$PWD/resolver.conf
+kill() { echo "signal:$*"; rm -rf "proc/$2"; }
+note() { echo "$*"; }
+''' + self.resolver_helpers('stop_resolver') + '\nstop_resolver; echo result:$?\n', fixture)
+        self.assertEqual(output.splitlines(), ['signal:-TERM 52', 'result:0'])
+
     def test_teardown_always_flushes_previous_instance_after_copy_sync(self):
         output = self.run_shell('''
 STATE_DIR=state; RUN_DIR=run; RESOLVER_CONF=resolver; DNS_INSTANCE=new

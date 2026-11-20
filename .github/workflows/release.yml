@@ -62,6 +62,7 @@ jobs:
           python3 tests/test_cgi.py
           python3 tests/test_diagnostics.py
           python3 tests/test_dns_cleanup.py
+          python3 tests/test_service_locks.py
           python3 tests/test_schedule_startup.py
           node tests/test_luci.js
 

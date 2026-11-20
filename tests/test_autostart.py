@@ -8,7 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 class AutostartTests(unittest.TestCase):
     def boot(self, autostart, enabled):
-        script = (ROOT / 'files/etc/init.d/xbox-accel').read_text()
+        script = 'initscript=/etc/init.d/xbox-accel\n' + (ROOT / 'files/etc/init.d/xbox-accel').read_text()
         mocks = '''
 config_load() { :; }
 config_get_bool() { case "$3" in autostart) eval "$1=$AUTO" ;; enabled) eval "$1=$ENABLED" ;; esac; }

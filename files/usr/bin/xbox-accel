@@ -73,9 +73,23 @@ rotate_log() {
 	rm -f "$LOG_FILE.new"
 }
 
-# 运行其他服务的脚本时关闭本进程持有的锁：它们拉起的常驻进程会继承已打开的文件，
-# 锁一旦被继承就永远不会释放。
-svc() { "$@" >/dev/null 2>&1 7>&- 8>&- 9>&-; }
+# 在服务子进程中清理全部继承描述符，调用方继续持有自己的锁。
+close_service_fds() {
+	local descriptor directory=/proc/self/fd
+	[ -d "$directory" ] || directory=/dev/fd
+	for descriptor in "$directory"/*; do
+		descriptor=${descriptor##*/}
+		case "$descriptor" in ''|*[!0-9]*|0|1|2) continue ;; esac
+		eval "exec $descriptor>&-"
+	done
+}
+
+svc() {
+	(
+		close_service_fds
+		"$@" >/dev/null 2>&1
+	)
+}
 
 cfg() {
 	local v
@@ -600,10 +614,52 @@ children_of() {
 
 # 只终止确认属于该任务的进程及其子进程，不按名字批量杀 curl
 kill_tree() {
-	local c
-	for c in $(children_of "$1"); do kill_tree "$c"; done
-	kill -TERM "$1" 2>/dev/null
+	local c signal=${2:-TERM}
+	for c in $(children_of "$1"); do kill_tree "$c" "$signal"; done
+	kill -"$signal" "$1" 2>/dev/null
 	return 0
+}
+
+# 从 rc.common 外层限制整个服务操作，覆盖它在加载阶段获取服务锁的等待。
+run_service_action() {
+	local action=${1:-help} limit worker watchdog timer marker result
+	[ "$#" -eq 0 ] || shift
+	case "$action" in
+	stop|shutdown|disable) limit=60 ;;
+	start|restart|reload|boot) limit=120 ;;
+	enable|enabled|running|status|info|help) limit=15 ;;
+	*) echo "错误：[SERVICE_ACTION_INVALID] 未知服务操作：$action" >&2; return 1 ;;
+	esac
+	limit=${XBOX_ACCEL_SERVICE_TIMEOUT:-$limit}
+	case "$limit" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$limit" -ge 1 ] && [ "$limit" -le 300 ] || return 1
+	mkdir -p "$RUN_DIR" || return 1
+	marker=$(mktemp "$RUN_DIR/service-timeout.XXXXXX") || return 1
+	/bin/sh /etc/rc.common "$INIT" "$action" "$@" &
+	worker=$!
+	(
+		close_service_fds
+		sleep "$limit" & timer=$!
+		trap 'kill "$timer" 2>/dev/null; exit 0' INT TERM
+		wait "$timer"
+		printf 'timeout\n' >"$marker"
+		echo "错误：[SERVICE_TIMEOUT] $action 超过 ${limit} 秒；正在终止等待的服务操作，清理记录保留" >&2
+		kill_tree "$worker"
+		sleep 1
+		kill_tree "$worker" KILL
+	) &
+	watchdog=$!
+	wait "$worker"; result=$?
+	# 超时时由 watchdog 完成整个子树的终止；正常退出时清理计时进程。
+	if [ -s "$marker" ]; then
+		wait "$watchdog" 2>/dev/null
+		result=124
+	else
+		kill -TERM "$watchdog" 2>/dev/null
+		wait "$watchdog" 2>/dev/null
+	fi
+	rm -f "$marker"
+	return "$result"
 }
 
 is_ancestor() {
@@ -1105,7 +1161,48 @@ apply() {
 	fi
 }
 
-resolver_running() { process_matches "$(cat "$RUN_DIR/dnsmasq.pid" 2>/dev/null)" "$RESOLVER_CONF"; }
+# 依据实际二进制和完整配置路径识别实例，PID 文件仅提供状态缓存。
+resolver_process() {
+	dnsmasq_process "$1" || return 1
+	dnsmasq_process_confs "$1" | grep -qxF "$(readlink -f "$RESOLVER_CONF")"
+}
+
+resolver_pids() {
+	local process pid
+	for process in /proc/[0-9]*; do
+		pid=${process##*/}
+		resolver_process "$pid" && echo "$pid"
+	done
+	return 0
+}
+
+resolver_running() {
+	[ -n "$(resolver_pids)" ]
+}
+
+# procd 停止后查验实际进程，兼容注册信息或 PID 文件遗失的情况。
+stop_resolver() {
+	local pid before after attempt signal
+	for signal in TERM KILL; do
+		for pid in $(resolver_pids); do
+			[ "$pid" -gt 1 ] || continue
+			before=$(sed 's/^[0-9]* (.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+			resolver_process "$pid" || continue
+			after=$(sed 's/^[0-9]* (.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+			[ -n "$before" ] && [ "$before" = "$after" ] || continue
+			kill -"$signal" "$pid" 2>/dev/null
+		done
+		for attempt in 1 2 3 4 5; do
+			if ! resolver_running; then
+				[ -z "$RUN_DIR" ] || rm -f "$RUN_DIR/dnsmasq.pid"
+				return 0
+			fi
+			sleep 1
+		done
+	done
+	note "[SERVICE_STOP_INCOMPLETE] 插件解析进程仍在运行，请检查进程状态"
+	return 1
+}
 
 # SIGHUP 只重新读 hosts/resolv 并清空缓存，不重启 DNS/DHCP 服务。
 # 按实际可执行文件和完整配置路径匹配，PID 文件仅作为服务状态信息。
@@ -1476,6 +1573,10 @@ EOF
 }
 
 case "$1" in -v|--version) echo "$VERSION"; exit 0 ;; esac
+case "$1" in
+_service) shift; run_service_action "$@"; exit $? ;;
+_stop_resolver) stop_resolver; exit $? ;;
+esac
 if [ ! -r "$SHARE_DIR/diagnostics.sh" ]; then
 	echo "错误：诊断模块缺失，请重新安装插件" >&2
 	exit 1

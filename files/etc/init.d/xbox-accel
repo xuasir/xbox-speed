@@ -1,5 +1,11 @@
-#!/bin/sh /etc/rc.common
+#!/bin/sh
 # xbox-accel: Xbox 下载 CDN 优选 + com→cn 重定向
+
+# 直接调用时先进入有期限的控制层；rc.common 加载本文件时仅注册服务钩子。
+if [ -z "${initscript:-}" ]; then
+	[ "$#" -gt 0 ] || set -- help
+	exec /usr/bin/xbox-accel _service "$@"
+fi
 
 START=99
 STOP=10
@@ -7,6 +13,11 @@ USE_PROCD=1
 
 PROG=/usr/bin/xbox-accel
 CONF=/var/etc/xbox-accel/dnsmasq.conf
+
+restart() {
+	stop "$@" || return $?
+	start "$@"
+}
 
 # Keep the init hook registered even when autostart is off: persisted DNS
 # rules from the previous session must be withdrawn before clients use them.
@@ -54,6 +65,14 @@ service_started() {
 
 stop_service() {
 	"$PROG" _teardown
+	XBOX_STOP_RESULT=$?
+	return "$XBOX_STOP_RESULT"
+}
+
+service_stopped() {
+	local result=${XBOX_STOP_RESULT:-0}
+	"$PROG" _stop_resolver || result=1
+	return "$result"
 }
 
 reload_service() {

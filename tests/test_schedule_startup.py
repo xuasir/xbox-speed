@@ -79,6 +79,26 @@ program() { echo "$1"; return 3; }
 ''' + start + '\nstart_service; echo result:$?')
         self.assertEqual(output, '_teardown\nresult:3')
 
+    def test_stopped_hook_returns_cleanup_or_process_stop_failure(self):
+        hook = function('files/etc/init.d/xbox-accel', 'service_stopped')
+        for cleanup, stop, expected in ((0, 0, 0), (1, 0, 1), (0, 1, 1)):
+            output = self.run_shell('''
+PROG=program
+program() { return "$STOP_RESULT"; }
+''' + hook + f'''
+XBOX_STOP_RESULT={cleanup}; STOP_RESULT={stop}
+service_stopped; echo result:$?
+''')
+            self.assertEqual(output, f'result:{expected}')
+
+    def test_restart_stops_at_failed_cleanup(self):
+        restart = function('files/etc/init.d/xbox-accel', 'restart')
+        output = self.run_shell('''
+stop() { echo stop; return 3; }
+start() { echo start; }
+''' + restart + '\nrestart; echo result:$?')
+        self.assertEqual(output, 'stop\nresult:3')
+
 
 if __name__ == '__main__':
     unittest.main()

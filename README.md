@@ -46,6 +46,8 @@ opkg install /root/luci-app-xbox-accel_0.3.0-1_all.ipk
 
 依赖由 opkg 安装：`luci-base`、`rpcd`、`curl`、`uhttpd`、`jshn`。必须已存在标准 dnsmasq 或 dnsmasq-full；插件不会替换它。BusyBox 需提供 flock、nslookup 等标准命令。
 
+旧版升级时若出现多个 `flock 1000` 持续等待，请按[服务锁恢复步骤](docs/UPGRADE_LOCK_RECOVERY.md)修补现有脚本、重启路由器，再安装包含修复的软件包。
+
 安装后刷新或重新登录 LuCI，进入 **服务 → Xbox 下载加速**。**默认未启用**，首次安装不会添加主 DNS 规则、修改 Web 配置或创建测速计划。
 
 建议先“重新检测”，选择运营商和测速周期，再启用并保存应用。不要把测速时取得的 IP 当作经过微软认证的节点。
@@ -122,6 +124,8 @@ sh install.sh
 - 后台操作返回“已受理”及任务 ID。最终状态区分成功、部分完成、失败、取消、跳过和异常中断；分组失败或应用验收异常会进入最终结果。
 - “生成脱敏报告”在后台收集固定白名单字段，完成后下载 JSON。报告包含任务摘要、当前完整检测、历史验收、近期及上次任务日志；IPv4、IPv6、MAC 使用报告内一致别名，URL 路径、参数及认证信息脱敏。文件读取权限仅授予插件固定报告路径，分享前建议检查内容。
 - 取消任务会等待终态保存；清空日志同时清除内存日志和持久快照，任务及验收摘要保留。任务和配置操作使用不同锁，常驻服务启动前关闭继承的锁描述符。
+
+服务子进程清理全部继承描述符。停用从 `rc.common` 外层限制在 60 秒内；超时返回 `124 / SERVICE_TIMEOUT` 并保留清理记录。解析实例按实际二进制和完整配置路径识别，PID 文件遗失或错误时仍可发现并停止本插件实例；清理失败会返回失败，重启随后中止。
 
 错误代码、退出码和实机验收步骤见 [诊断与验收说明](docs/DIAGNOSTICS.md)。
 
@@ -222,12 +226,14 @@ sh install.sh purge     # 同时清除配置与记录
 python3 tools/build_ipk.py  # 生成 dist 下的 ipk 和源码 tar.gz
 node tests/test_luci.js
 python3 tests/test_dns_cleanup.py
+python3 tests/test_service_locks.py
 python3 tests/test_schedule_startup.py
 python3 tests/test_diagnostics.py
 python3 tests/test_cgi.py
 # 只在可丢弃的 Docker OpenWrt 容器运行，绝不可指向主力设备：
 python3 tests/test_cgi_openwrt.py xa-test  # BusyBox CGI、真实 302 与 LuCI 共存
 python3 tests/test_openwrt.py xa-test
+python3 tests/test_service_stop_openwrt.py xa-test  # 服务锁超时、清理失败、PID 文件异常
 python3 tests/test_diagnostics_openwrt.py xa-test
 ```
 
