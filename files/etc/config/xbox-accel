@@ -1,0 +1,41 @@
+config main 'main'
+	# 总开关。建议用 xbox-accel enable / disable 切换
+	option enabled '0'
+
+	# 国内下载域名（*.xboxlive.cn）指向最快节点
+	option optimize_cn '1'
+	# 国际下载域名（*.xboxlive.com）指向最快节点
+	option optimize_com '1'
+	# 把国际下载域名 302 到国内域名。开启后国际域名不再优选
+	option redirect_cn '0'
+	# 同时接管主机通过 SRV 记录拿到的 4 个备用 CDN 主机名
+	option override_cdn_hosts '1'
+
+	# 运营商：auto（只按本线路发现候选）/ telecom / unicom / mobile
+	# 选了运营商后，会额外询问该运营商其他地区的节点来扩大候选范围
+	option isp 'auto'
+
+	# 测速与健康检查的定时
+	option cron '15 5 * * *'
+	option health_interval '10'
+
+	# 初筛与复测的单节点上限
+	option quick_size_mb '4'
+	option quick_time '4'
+	option full_size_mb '64'
+	option full_time '10'
+	option top_n '3'
+	option max_candidates '60'
+	# 新节点比当前节点快多少（百分比）才切换
+	option switch_threshold '15'
+
+	# 插件解析实例的监听端口，以及未固定域名使用的上游 DNS
+	option resolver_port '5335'
+	option dnsmasq_instance '@dnsmasq[0]'
+	option ttl '30'
+	list fallback_dns '223.5.5.5'
+	list fallback_dns '119.29.29.29'
+
+	# 把候选与选中节点加入 Passwall 直连集合；规则变化时自动重启 Passwall
+	option passwall_direct '1'
+	option passwall_restart '1'

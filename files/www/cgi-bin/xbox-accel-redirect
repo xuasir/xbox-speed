@@ -1,0 +1,28 @@
+#!/bin/sh
+# 由 uhttpd 的 error_page 调用：把 Xbox 国际下载请求 302 到国内域名。
+# 其他请求维持普通的 404。
+
+host=${HTTP_HOST%%:*}
+case "$host" in
+dlassets.xboxlive.com | dlassets2.xboxlive.com)
+	target=dlassets.xboxlive.cn
+	;;
+assets1.xboxlive.com | assets2.xboxlive.com | d1.xboxlive.com | d2.xboxlive.com | \
+	xvcf1.xboxlive.com | xvcf2.xboxlive.com | 5.xb.delivery.microsoft.com | \
+	assets1.xboxlive.com.edgesuite.net | cl-glcb907925.gcdn.co | fg.microsoft.map.fastly.net)
+	target=assets1.xboxlive.cn
+	;;
+*)
+	printf 'Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found\n'
+	exit 0
+	;;
+esac
+
+uri=$REQUEST_URI
+# 不允许请求 URI 中的原始 CR/LF 进入响应头。
+if [ "$(printf '%s' "$uri" | LC_ALL=C tr -d '[:cntrl:]')" != "$uri" ]; then
+	printf 'Status: 400 Bad Request\r\nContent-Length: 0\r\n\r\n'
+	exit 0
+fi
+case "$uri" in /*) ;; *) uri=/ ;; esac
+printf 'Status: 302 Found\r\nLocation: http://%s%s\r\nContent-Length: 0\r\n\r\n' "$target" "$uri"

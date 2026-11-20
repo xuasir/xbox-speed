@@ -1,0 +1,8 @@
+{
+  "admin/services/xbox-accel": {
+    "title": "Xbox 下载加速",
+    "order": 65,
+    "action": { "type": "view", "path": "xbox-accel/overview" },
+    "depends": { "acl": ["luci-app-xbox-accel"], "uci": {"xbox-accel": true} }
+  }
+}

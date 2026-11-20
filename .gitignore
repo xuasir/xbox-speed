@@ -1,0 +1,51 @@
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Build and release outputs
+/dist/
+/build/
+*.ipk
+*.apk
+*.tar.gz
+/BUILD_INFO.json
+/INSTALL.txt
+
+# Local CI and disposable test tooling
+/.ci-tools/
+/.ci-test/
+/.review/
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node dependencies and caches
+node_modules/
+.npm/
+.pnpm-store/
+
+# Editor and temporary files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.tmp
+*.log
+
+# Local secrets; examples may be committed
+.env
+.env.*
+!.env.example
+!.env.sample

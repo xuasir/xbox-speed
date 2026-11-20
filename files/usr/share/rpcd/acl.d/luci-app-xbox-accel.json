@@ -1,0 +1,26 @@
+{
+	"luci-app-xbox-accel": {
+		"description": "Grant access to Xbox Accel status, fixed actions and its own configuration",
+		"read": {
+			"ubus": {
+				"xbox-accel": [
+					"status",
+					"environment"
+				]
+			},
+			"uci": [
+				"xbox-accel"
+			]
+		},
+		"write": {
+			"ubus": {
+				"xbox-accel": [
+					"action"
+				]
+			},
+			"uci": [
+				"xbox-accel"
+			]
+		}
+	}
+}
