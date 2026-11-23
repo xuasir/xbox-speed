@@ -44,6 +44,15 @@ class ErrorClassificationTests(unittest.TestCase):
         self.assertNotIn('secret', value)
         self.assertIn('?<redacted>', value)
 
+    def test_safe_text_never_writes_warnings_to_stderr(self):
+        # gawk warnings from the redaction regexp would be counted as log lines.
+        result = subprocess.run(['sh', '-c', '. "$1"; shift; "$@"', 'diagnostics-test', str(LIB),
+                                 'safe_text', 'http://host/p?token=private&sig=secret trailing'],
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(result.stderr, '')
+        self.assertIn('?<redacted>', result.stdout)
+        self.assertNotIn('private', result.stdout)
+
     def test_export_redacts_compressed_ipv6_mac_and_url_credentials(self):
         text = redact({'log': '::1 fe80::abcd%br-lan ::ffff:203.0.113.77 2001:db8:0:0:0:0:0:1 AA:BB:CC:DD:EE:FF aa:bb:cc:dd:ee:ff',
                        'url': 'https://user:PRIVATE_PASSWORD@cdn.example/private/path?token=PRIVATE_TOKEN',
