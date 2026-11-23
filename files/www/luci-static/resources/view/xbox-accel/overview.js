@@ -160,7 +160,7 @@ return view.extend({
 		var o;
 
 		flag('basic', 'enabled', '启用', '0',
-			'关闭后会撤销本插件对主 dnsmasq、uhttpd 和计划任务所做的全部改动。');
+			'关闭后会撤销域名规则、专用端口转发与计划任务，并停止独立解析和重定向服务。');
 		flag('basic', 'autostart', '开机自启动', '1',
 			'路由器启动后自动恢复已启用的加速功能。关闭此项后，重启时只清理旧规则；可在页面重新应用以手动启动。总开关关闭时不会自启动。');
 		flag('platforms', 'optimize_cn', '国内 CDN 优选', '1',
@@ -168,8 +168,8 @@ return view.extend({
 		flag('platforms', 'optimize_com', '国际 CDN 优选', '1',
 			'把 assets1.xboxlive.com 等国际下载域名指向测速最快的节点。');
 		flag('platforms', 'redirect_cn', '国际下载重定向到国内（com→cn）', '0',
-			'把发往国际下载域名的请求用 HTTP 302 转到国内域名，开启后国际域名不再做 CDN 优选。' +
-			'需要路由器的 uhttpd 在 80 端口提供 HTTP。个别游戏在国内 CDN 上可能很慢或无法下载，遇到时请关闭此项。');
+			'把发往国际下载域名的 HTTP 请求用 302 转到国内域名，开启后优先使用重定向。' +
+			'插件自动启动独立 HTTP 服务，LuCI 保留现有端口和 HTTPS 设置。国内资源很慢或无法下载时请关闭此项。');
 
 		PLATFORMS.forEach(function(platform) {
 			var description = '独立发现、测速和保存该平台的节点，启用后参加定时测速与健康检查。';
@@ -301,9 +301,12 @@ return view.extend({
 		o.default = [ '223.5.5.5', '119.29.29.29' ];
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.Value, 'redirect_ip', '重定向使用的路由器地址',
-			'com→cn 重定向时，国际下载域名会解析到这个地址。留空则使用 LAN 口地址。');
+		number('advanced', 'redirect_port', '重定向服务端口', '18081', 1024, 65535,
+			'插件独立 HTTP 服务的监听端口，专用入口的 80 请求会转发到这里。请选择空闲端口，并与解析端口分开。');
+		o = s.taboption('advanced', form.Value, 'redirect_ip', '重定向专用入口地址',
+			'国际下载域名解析到这个虚拟 IPv4，默认 192.0.2.1。地址需位于直连网段之外，并专用于重定向；LAN 客户端通过本路由器访问该地址。');
 		o.datatype = 'ip4addr';
+		o.placeholder = '192.0.2.1';
 		o.optional = true;
 
 		o = s.taboption('advanced', form.Value, 'test_url_cn', '国内测速文件',
@@ -422,7 +425,8 @@ return view.extend({
 
 		if (invalid) com='未知（未取得有效状态）';
 		else if (status.mode == 'redirect')
-			com = '%s，入口 http://%s'.format(COM_MODES.redirect, status.lan_ip || '?');
+			com = '%s，入口 http://%s，独立服务端口 %s（%s）'.format(COM_MODES.redirect, status.redirect_ip || '?', status.redirect_port || '?',
+				status.redirect_running === true ? (status.redirect_ready === false ? '监听异常' : '运行中') : status.redirect_running === false ? '已停止' : '状态待确认');
 		else if (status.mode == 'optimize')
 			com = nodeText(status.com_ip, status.com_speed, status.com_time);
 		else

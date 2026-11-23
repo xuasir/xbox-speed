@@ -14,7 +14,7 @@ import test_cgi
 
 
 CONTAINER = sys.argv.pop(1) if len(sys.argv) > 1 else 'xa-test'
-PORT = 18081
+PORT = 18082
 
 
 def docker(*args, input=None):
@@ -32,13 +32,14 @@ class OpenWrtRedirectTests(test_cgi.RedirectTests):
         if not root.startswith('/tmp/xbox-accel-cgi.') or '/' in root[len('/tmp/'):]:
             raise AssertionError(f'Unexpected temporary directory: {root!r}')
         cls.addClassCleanup(docker, 'rm', '-rf', root)
-        cls.cgi = str(pathlib.PurePosixPath(root) / 'cgi-bin/xbox-accel-redirect')
-        docker('sh', '-c', 'mkdir "$1/cgi-bin"; ln -s /www/cgi-bin/luci "$1/cgi-bin/luci"; ln -s /www/luci-static "$1/luci-static"', 'sh', root)
+        cls.cgi = str(pathlib.PurePosixPath(root) / 'redirect.cgi')
+        docker('touch', root + '.conf')
+        cls.addClassCleanup(docker, 'rm', '-f', root + '.conf', root + '.log')
         docker('sh', '-c', 'cat > "$1"; chmod 755 "$1"', 'sh', cls.cgi, input=test_cgi.CGI.read_bytes())
         pid = docker(
             'sh', '-c',
-            '/usr/sbin/uhttpd -f -h "$1" -x /cgi-bin -u /ubus -R -p "127.0.0.1:$2" '
-            '-E /cgi-bin/xbox-accel-redirect >"$1/uhttpd.log" 2>&1 & echo $!',
+            '/usr/sbin/uhttpd -f -h "$1" -c "$1.conf" -x / -I redirect.cgi -D -S -p "127.0.0.1:$2" '
+            '-E /redirect.cgi >"$1.log" 2>&1 & echo $!',
             'sh', root, str(PORT),
         ).decode().strip()
         if not pid.isdigit():
@@ -51,7 +52,7 @@ class OpenWrtRedirectTests(test_cgi.RedirectTests):
                 return
             except subprocess.CalledProcessError:
                 time.sleep(0.1)
-        raise AssertionError(docker('cat', root + '/uhttpd.log').decode())
+        raise AssertionError(docker('cat', root + '.log').decode())
 
     def run_cgi(self, host, uri):
         return docker('env', 'HTTP_HOST=' + host, 'REQUEST_URI=' + uri, '/bin/sh', self.cgi).decode()
@@ -73,6 +74,9 @@ class OpenWrtRedirectTests(test_cgi.RedirectTests):
             ('assets1.xboxlive.com', '/xbox-accel/selftest?probe=1', 'assets1.xboxlive.cn'),
             ('assets1.xboxlive.com', '/5/file?x=1&y=2', 'assets1.xboxlive.cn'),
             ('dlassets2.xboxlive.com:80', '/file', 'dlassets.xboxlive.cn'),
+            ('assets1.xboxlive.com', '/', 'assets1.xboxlive.cn'),
+            ('assets1.xboxlive.com', '/luci-static/resources/luci.js', 'assets1.xboxlive.cn'),
+            ('assets1.xboxlive.com', '/cgi-bin/luci/admin/services/xbox-accel', 'assets1.xboxlive.cn'),
         ]:
             with self.subTest(host=host, uri=uri):
                 status, fields, _ = self.request(host, uri)
@@ -84,14 +88,18 @@ class OpenWrtRedirectTests(test_cgi.RedirectTests):
         self.assertEqual(status, 404)
         self.assertNotIn('Location', fields)
 
-    def test_http_luci(self):
+    def test_http_luci_stays_on_main_service(self):
         uri = '/cgi-bin/luci/admin/services/xbox-accel'
         baseline_status, _, _ = self.request('router.lan', uri, port=80)
         status, fields, body = self.request('router.lan', uri)
-        self.assertEqual(status, baseline_status)
-        self.assertIn('name="luci_username"', body)
+        self.assertEqual(status, 404)
+        self.assertNotIn('name="luci_username"', body)
         self.assertNotIn('Location', fields)
         status, _, body = self.request('router.lan', '/luci-static/resources/luci.js')
+        self.assertEqual(status, 404)
+        self.assertNotIn('LuCI', body)
+        self.assertEqual(self.request('router.lan', uri, port=80)[0], baseline_status)
+        status, _, body = self.request('router.lan', '/luci-static/resources/luci.js', port=80)
         self.assertEqual(status, 200)
         self.assertIn('LuCI', body)
 

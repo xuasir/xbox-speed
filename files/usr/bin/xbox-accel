@@ -12,6 +12,9 @@ RESOLVER_CONF=/var/etc/xbox-accel/dnsmasq.conf
 SHARE_DIR=/usr/share/xbox-accel
 INIT=/etc/init.d/xbox-accel
 CGI_URL=/cgi-bin/xbox-accel-redirect
+REDIRECT_ROOT=/var/etc/xbox-accel/redirect
+REDIRECT_CONF=/var/etc/xbox-accel/redirect.conf
+REDIRECT_HTTPD_CONF=/var/etc/xbox-accel/redirect.httpd.conf
 CRON_FILE=/etc/crontabs/root
 CRON_TAG='# xbox-accel'
 
@@ -231,9 +234,9 @@ best_domains() { cat "$STATE_DIR/domains_$1" 2>/dev/null; }
 
 lan_ip() {
 	local ip
-	ip=$(cfg redirect_ip "")
+	ip=$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
 	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr | awk '{print $1}')
-	[ -n "$ip" ] || ip=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{print $2; exit}')
+	[ -n "$ip" ] || ip=$(ip -4 addr show dev "$(redirect_device)" 2>/dev/null | awk '/inet /{print $2; exit}')
 	echo "${ip%%/*}" | ipv4s | head -n 1
 }
 
@@ -299,20 +302,11 @@ validate_config() {
 		[ "$(url_scheme "$url")" = http ] && [ "$host" = "assets1.xboxlive.$g" ] && platform_url_valid "$g" "$url" || die "测速 URL 必须使用 http://assets1.xboxlive.$g/ 路径"
 	done
 	validate_platform_config
-}
-
-# ---------- 重定向（com→cn）前置条件 ----------
-
-# 输出不能启用的原因；可以启用时无输出
-redirect_blocker() {
-	[ -x /usr/sbin/uhttpd ] || { echo "未安装 uhttpd"; return; }
-	uci -q get uhttpd.main >/dev/null || { echo "找不到 uhttpd.main 配置"; return; }
-	uci -q get uhttpd.main.listen_http | tr ' ' '\n' | grep -qE ':80$' ||
-		{ echo "uhttpd 没有监听 80 端口"; return; }
-	[ "$(uci -q get uhttpd.main.redirect_https)" = 1 ] &&
-		{ echo "uhttpd 开启了强制跳转 HTTPS（redirect_https）"; return; }
-	[ -x "/www$CGI_URL" ] || { echo "缺少 /www$CGI_URL"; return; }
-	[ -n "$(lan_ip)" ] || { echo "无法确定路由器 LAN IP，请设置 redirect_ip"; return; }
+	if cfg_bool redirect_cn 0; then
+		v=$(redirect_blocker)
+		[ -z "$v" ] || die "重定向配置无效：$v"
+	fi
+	return 0
 }
 
 # 国际域名的工作模式：redirect / optimize / off
@@ -809,7 +803,7 @@ gen_resolver_conf() {
 
 	case "$(com_mode)" in
 	redirect)
-		target=$(lan_ip)
+		target=$(redirect_ip)
 		for d in $COM_DOMAINS $COM_DL_DOMAINS; do pin "$d" "$target"; done
 		cfg_bool override_cdn_hosts 1 && for d in $CDN_HOSTS; do pin "$d" "$target"; done
 		srv_rules
@@ -1092,39 +1086,28 @@ sync_passwall() {
 	return 0
 }
 
-# ---------- uhttpd 的 302 入口 ----------
+# ---------- 旧版主 uhttpd 配置的迁移清理 ----------
 
 sync_uhttpd() {
-	local want=$1 cur
+	local cur
 	uci -q get uhttpd.main >/dev/null || {
 		[ ! -e "$STATE_DIR/uhttpd_pending" ] && [ ! -e "$STATE_DIR/uhttpd_error_page" ]
 		return $?
 	}
 	cur=$(uci -q get uhttpd.main.error_page)
-	if [ "$want" = 1 ]; then
-		[ "$cur" = "$CGI_URL" ] && [ ! -e "$STATE_DIR/uhttpd_pending" ] && return 0
-		mkdir -p "$STATE_DIR" || return 1
-		if [ "$cur" != "$CGI_URL" ] && [ -n "$cur" ]; then
-			echo "$cur" >"$STATE_DIR/uhttpd_error_page" || return 1
-		fi
-		: >"$STATE_DIR/uhttpd_pending" || return 1
-		uci -q set "uhttpd.main.error_page=$CGI_URL" || return 1
-	else
-		[ "$cur" = "$CGI_URL" ] || [ -e "$STATE_DIR/uhttpd_pending" ] || [ -e "$STATE_DIR/uhttpd_error_page" ] || return 0
-		mkdir -p "$STATE_DIR" || return 1
-		: >"$STATE_DIR/uhttpd_pending" || return 1
-		if [ "$cur" = "$CGI_URL" ]; then
-			if [ -s "$STATE_DIR/uhttpd_error_page" ]; then
-				uci -q set "uhttpd.main.error_page=$(cat "$STATE_DIR/uhttpd_error_page")" || return 1
-			else
-				uci -q delete uhttpd.main.error_page || return 1
-			fi
+	[ "$cur" = "$CGI_URL" ] || [ -e "$STATE_DIR/uhttpd_pending" ] || [ -e "$STATE_DIR/uhttpd_error_page" ] || return 0
+	mkdir -p "$STATE_DIR" || return 1
+	: >"$STATE_DIR/uhttpd_pending" || return 1
+	if [ "$cur" = "$CGI_URL" ]; then
+		if [ -s "$STATE_DIR/uhttpd_error_page" ]; then
+			uci -q set "uhttpd.main.error_page=$(cat "$STATE_DIR/uhttpd_error_page")" || return 1
+		else
+			uci -q delete uhttpd.main.error_page || return 1
 		fi
 	fi
 	uci -q commit uhttpd || return 1
 	svc /etc/init.d/uhttpd restart || return 1
-	rm -f "$STATE_DIR/uhttpd_pending"
-	[ "$want" = 1 ] || rm -f "$STATE_DIR/uhttpd_error_page"
+	rm -f "$STATE_DIR/uhttpd_pending" "$STATE_DIR/uhttpd_error_page"
 	return 0
 }
 
@@ -1172,6 +1155,8 @@ setup() {
 	local why previous_rules main_rc
 	validate_config
 	apply_lock
+	migrate_redirect_ip || return 1
+	sync_uhttpd 0 || return 1
 	previous_rules=$(cat "$STATE_DIR/main_rules" 2>/dev/null)
 	# 保存旧端口与被关闭的分组规则，直到运行中的副本已完成重载。
 	if [ -n "$previous_rules" ]; then
@@ -1179,12 +1164,12 @@ setup() {
 	fi
 	if cfg_bool redirect_cn 0; then
 		why=$(redirect_blocker)
-		[ -n "$why" ] && note "com→cn 重定向无法启用：$why；国际域名改按“国际 CDN 优选”的设置处理"
+		[ -z "$why" ] || { note "独立重定向服务准备失败：$why"; return 1; }
 	fi
+	if [ "$(com_mode)" = redirect ]; then sync_redirect 1; else sync_redirect 0; fi || return 1
 	write_resolver_conf
 	sync_main 1; main_rc=$?
 	case "$main_rc" in 0) svc /etc/init.d/dnsmasq restart || return 1; rm -f "$STATE_DIR/main_reload_needed" ;; 1) ;; *) return 1 ;; esac
-	if [ "$(com_mode)" = redirect ]; then sync_uhttpd 1; else sync_uhttpd 0; fi || return 1
 	sync_cron 1 || return 1
 	passwall_direct $(selected_ips)
 	com_mode >"$RUN_DIR/applied_mode"
@@ -1194,9 +1179,18 @@ setup() {
 
 # 解析实例就绪后再检查 Passwall，避免它重启时规则指向一个还没起来的端口
 post_start() {
-	local g missing=1
+	local g attempt missing=1
 	apply_lock
+	if [ "$(cat "$RUN_DIR/applied_mode" 2>/dev/null)" = redirect ]; then
+		for attempt in 1 2 3 4 5; do
+			redirect_ready && redirect_firewall_ready && break
+			sleep 1
+		done
+		redirect_ready && redirect_firewall_ready || { note '独立重定向监听或转发规则尚未就绪'; return 1; }
+		redirect_pids | head -n 1 >"$RUN_DIR/redirect.pid"
+	fi
 	sync_passwall "$(pending_cleanup_rules)" || return 1
+	if [ "$(cat "$RUN_DIR/applied_mode" 2>/dev/null)" = redirect ]; then redirect_firewall_ready || sync_redirect 1 || return 1; fi
 	if [ -f "$RUN_DIR/cache_flush_needed" ] || [ -s "$STATE_DIR/pending_rules" ] || [ -s "$RUN_DIR/pending_rules" ]; then
 		flush_front_cache || return 1
 		rm -f "$RUN_DIR/cache_flush_needed"
@@ -1228,6 +1222,7 @@ teardown() {
 	1) ;; *) result=1 ;;
 	esac
 	sync_uhttpd 0 || result=1
+	sync_redirect 0 || result=1
 	sync_cron 0 || result=1
 	sync_passwall "$stale_rules" || result=1
 	# 即使规则早已移除（或重复停用），前置 DNS 仍可能缓存旧地址。
@@ -1334,6 +1329,12 @@ drifted() {
 	resolver_running || return 0
 	[ "$(cat "$RUN_DIR/applied_mode" 2>/dev/null)" = "$(com_mode)" ] || return 0
 	[ "$(cat "$RUN_DIR/applied_groups" 2>/dev/null)" = "$(groups_active)" ] || return 0
+	if [ "$(com_mode)" = redirect ]; then
+		redirect_ready && redirect_firewall_ready || return 0
+	else
+		redirect_running && return 0
+		redirect_firewall_present && return 0
+	fi
 	now=$(main_rules_now)
 	for e in $(cat "$STATE_DIR/main_rules" 2>/dev/null); do
 		echo "$now" | grep -qxF "$e" || return 0
@@ -1361,7 +1362,7 @@ expected_ip() {
 	cn) cfg_bool optimize_cn 1 && best_domains cn | grep -qw assets1.xboxlive.cn && best_ip cn ;;
 	com)
 		case "$(com_mode)" in
-		redirect) lan_ip ;;
+		redirect) redirect_ip ;;
 		optimize) best_domains com | grep -qw assets1.xboxlive.com && best_ip com ;;
 		esac
 		;;
@@ -1416,6 +1417,12 @@ json_status() {
 	json_add_string mode "$(com_mode)"
 	if cfg_bool optimize_cn 1; then json_add_boolean optimize_cn 1; else json_add_boolean optimize_cn 0; fi
 	json_add_string lan_ip "$(lan_ip)"
+	json_add_string redirect_ip "$(redirect_ip)"
+	json_add_string redirect_port "$(redirect_port)"
+	if redirect_running; then
+		json_add_boolean redirect_running 1
+		if redirect_ready; then json_add_boolean redirect_ready 1; else json_add_boolean redirect_ready 0; fi
+	else json_add_boolean redirect_running 0; json_add_boolean redirect_ready 0; fi
 	for g in $ALL_GROUPS; do
 		json_add_string "${g}_ip" "$(best_ip "$g")"
 		last=$(cat "$TMP_DIR/last_$g" 2>/dev/null)
@@ -1602,7 +1609,7 @@ cmd_status() {
 	fi
 	cfg_bool optimize_cn 1 && say "国内域名：优选" || say "国内域名：不处理"
 	case "$(com_mode)" in
-	redirect) say "国际域名：重定向到国内（302 入口 $(lan_ip)）" ;;
+	redirect) say "国际域名：重定向到国内（入口 $(redirect_ip):80，独立服务 $(lan_ip):$(redirect_port)）" ;;
 	optimize) say "国际域名：优选" ;;
 	off) say "国际域名：不处理" ;;
 	esac
@@ -1710,6 +1717,12 @@ case "$1" in -v|--version) echo "$VERSION"; exit 0 ;; esac
 case "$1" in
 _service) shift; run_service_action "$@"; exit $? ;;
 _stop_resolver) stop_resolver; exit $? ;;
+esac
+[ -r "$SHARE_DIR/redirect.sh" ] || { echo '错误：重定向模块缺失，请重新安装插件' >&2; exit 1; }
+. "$SHARE_DIR/redirect.sh"
+case "$1" in
+_stop_redirect) stop_redirect; exit $? ;;
+_restore_redirect) restore_redirect_firewall; exit $? ;;
 esac
 [ -r "$SHARE_DIR/platforms.sh" ] || { echo '错误：平台模块缺失，请重新安装插件' >&2; exit 1; }
 . "$SHARE_DIR/platforms.sh"

@@ -10,7 +10,9 @@ SRC=$(cd "$(dirname "$0")" && pwd)/files
 FILES="
 /usr/bin/xbox-accel
 /etc/init.d/xbox-accel
-/www/cgi-bin/xbox-accel-redirect
+/usr/share/xbox-accel/redirect.cgi
+/usr/share/xbox-accel/redirect.sh
+/usr/share/xbox-accel/firewall.sh
 /usr/share/xbox-accel/seeds.cn
 /usr/share/xbox-accel/seeds.com
 /usr/share/xbox-accel/seeds.store
@@ -31,7 +33,7 @@ FILES="
 /usr/share/rpcd/acl.d/luci-app-xbox-accel.json
 /www/luci-static/resources/view/xbox-accel/overview.js
 "
-EXECUTABLES="/usr/bin/xbox-accel /etc/init.d/xbox-accel /www/cgi-bin/xbox-accel-redirect /usr/libexec/rpcd/xbox-accel"
+EXECUTABLES="/usr/bin/xbox-accel /etc/init.d/xbox-accel /usr/share/xbox-accel/redirect.cgi /usr/share/xbox-accel/firewall.sh /usr/libexec/rpcd/xbox-accel"
 
 [ "$(id -u)" = 0 ] || { echo "请用 root 执行" >&2; exit 1; }
 [ -f /etc/openwrt_release ] || { echo "这不是 OpenWrt 系统" >&2; exit 1; }
@@ -73,6 +75,7 @@ do_remove() {
 		/etc/init.d/xbox-accel disable >/dev/null 2>&1 || true
 	fi
 	for f in $FILES; do rm -f "$f"; done
+	rm -f /www/cgi-bin/xbox-accel-redirect
 	rmdir /usr/share/xbox-accel /www/luci-static/resources/view/xbox-accel 2>/dev/null || true
 	rm -rf /var/etc/xbox-accel /var/run/xbox-accel /tmp/xbox-accel
 	refresh_luci
@@ -122,6 +125,7 @@ fi
 if [ -x /etc/init.d/xbox-accel ]; then
 	/etc/init.d/xbox-accel stop || { echo "旧版本停用失败，已取消升级" >&2; exit 1; }
 fi
+rm -f /www/cgi-bin/xbox-accel-redirect
 
 echo "== 文件"
 for f in $FILES; do

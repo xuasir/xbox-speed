@@ -160,7 +160,12 @@ group_result_ready() {
     return 0
 }
 
-selected_ips() { local g; for g in $(groups_active); do best_ip "$g"; done; return 0; }
+selected_ips() {
+    local g
+    for g in $(groups_active); do best_ip "$g"; done
+    [ "$(com_mode)" = redirect ] && redirect_ip
+    return 0
+}
 
 probe_resource() {
     probe "$1" "$(url_host "$2")" "$(url_path "$2")" "$3" "$4" "$5" "$(url_scheme "$2")" "$(group_user_agent "$6")"

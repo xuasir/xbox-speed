@@ -91,6 +91,20 @@ service_stopped; echo result:$?
 ''')
             self.assertEqual(output, f'result:{expected}')
 
+    def test_started_hook_keeps_setup_failure_and_skips_post_start(self):
+        start = function('files/etc/init.d/xbox-accel', 'start_service')
+        hook = function('files/etc/init.d/xbox-accel', 'service_started')
+        output = self.run_shell('''
+PROG=program; CONF=/dev/null
+config_load() { :; }
+config_get_bool() { eval "$1=1"; }
+program() { if [ "$1" = _setup ]; then return 17; fi; echo unexpected-post-start; }
+''' + start + '\n' + hook + '''
+start_service; echo start:$?
+service_started; echo hook:$?
+''')
+        self.assertEqual(output, 'start:17\nhook:17')
+
     def test_restart_stops_at_failed_cleanup(self):
         restart = function('files/etc/init.d/xbox-accel', 'restart')
         output = self.run_shell('''

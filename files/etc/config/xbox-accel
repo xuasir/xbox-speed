@@ -10,6 +10,11 @@ config main 'main'
 	option optimize_com '1'
 	# 把国际下载域名 302 到国内域名。开启后国际域名不再优选
 	option redirect_cn '0'
+	# 独立重定向服务端口；专用虚拟地址需位于直连网段之外
+	option redirect_port '18081'
+	option redirect_ip '192.0.2.1'
+	# 独立服务配置版本，用于迁移旧版 redirect_ip 的路由器地址语义
+	option redirect_service_version '1'
 	# 同时接管主机通过 SRV 记录拿到的 4 个备用 CDN 主机名
 	option override_cdn_hosts '1'
 

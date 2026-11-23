@@ -62,8 +62,8 @@ class OpenWrtTests(unittest.TestCase):
         before = shell('uci show dhcp; uci show uhttpd').stdout
         shell('uci set xbox-accel.main.enabled=1; uci set xbox-accel.main.redirect_cn=1; uci commit xbox-accel; /etc/init.d/xbox-accel reload')
         # service startup can take a few seconds in this Docker rootfs
-        shell('for i in 1 2 3 4 5 6 7 8; do dig @127.0.0.1 assets1.xboxlive.com A +short +time=1 +tries=1 | grep -qx 192.168.1.1 && break; sleep 1; done')
-        self.assertEqual(shell('dig @127.0.0.1 assets1.xboxlive.com A +short').stdout.strip(),'192.168.1.1')
+        shell('for i in 1 2 3 4 5 6 7 8; do dig @127.0.0.1 assets1.xboxlive.com A +short +time=1 +tries=1 | grep -qx 192.0.2.1 && break; sleep 1; done')
+        self.assertEqual(shell('dig @127.0.0.1 assets1.xboxlive.com A +short').stdout.strip(),'192.0.2.1')
         self.assertEqual(shell('dig @127.0.0.1 assets1.xboxlive.com AAAA +short').stdout.strip(),'')
         self.assertIn('assets1.xboxlive.com.',shell('dig @127.0.0.1 assets-srvs.xboxlive.com SRV +short').stdout)
         shell('xbox-accel disable >/dev/null')

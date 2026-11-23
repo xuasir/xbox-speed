@@ -1,5 +1,5 @@
 #!/bin/sh
-# 由 uhttpd 的 error_page 调用：把 Xbox 国际下载请求 302 到国内域名。
+# 由插件独立 uhttpd 的 error_page / index 调用：把国际下载请求 302 到国内域名。
 # 其他请求维持普通的 404。
 
 host=${HTTP_HOST%%:*}

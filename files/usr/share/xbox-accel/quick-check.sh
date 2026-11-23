@@ -16,6 +16,15 @@ quick_environment() {
     if ! is_enabled; then check_row 解析服务 skipped PLUGIN_DISABLED '插件未启用';
     elif resolver_running; then check_row 解析服务 ok RESOLVER_RUNNING '独立解析进程存在，还需要 DNS 读回验证';
     else check_row 解析服务 fail RESOLVER_NOT_RUNNING '独立解析进程不存在' '检查启动错误和端口冲突'; fi
+    if cfg_bool redirect_cn 0; then
+        value=$(redirect_blocker)
+        if [ -n "$value" ]; then check_row 重定向服务 fail REDIRECT_UNAVAILABLE "$value" '检查独立端口、专用地址与防火墙工具';
+        elif ! is_enabled; then check_row 重定向服务 skipped PLUGIN_DISABLED '插件未启用';
+        elif ! redirect_running; then check_row 重定向服务 fail REDIRECT_NOT_RUNNING '独立重定向进程缺失' '检查 procd 和启动日志';
+        elif ! redirect_ready; then check_row 重定向服务 fail REDIRECT_LISTENER_MISSING '独立进程的 LAN 或回环监听缺失' '检查端口绑定错误与 LAN 地址';
+        elif ! redirect_firewall_ready; then check_row 重定向转发 fail REDIRECT_RULES_MISSING '专用入口转发规则缺失或配置已改变' '重新应用';
+        else check_row 重定向服务 ok REDIRECT_READY "独立服务 $(lan_ip):$(redirect_port)，入口 $(redirect_ip):80；302 由完整验收验证"; fi
+    fi
     value=$(listeners_53)
     if [ "$value" = dnsmasq ]; then check_row 主DNS ok DNSMASQ_LISTENING 'UDP 53 由 dnsmasq 监听；尚未证明 Xbox 实际请求到此';
     elif [ -n "$value" ]; then check_row 主DNS warn NONSTANDARD_LISTENER "监听程序:$value" '确认客户端 DNS 入口';

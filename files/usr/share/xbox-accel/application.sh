@@ -18,7 +18,7 @@ append_application_summary() {
     json_set_namespace XA_APPLICATION_META_
     if jshn -r "$document" >/dev/null 2>&1 && json_load "$document" 2>/dev/null; then
         json_get_var checked checked_at; json_get_var signature configuration_signature
-        if json_select summary; then
+        if json_select summary >/dev/null 2>&1; then
             json_get_var status router; json_get_var passed passed; json_get_var failed failed
             json_get_var unknown unknown; json_get_var warnings warnings
             json_get_var measurement measurement; json_get_var direct_set direct_set
@@ -136,6 +136,11 @@ verify_disabled() {
     else check_row 撤销上游规则 skipped NO_OWNED_RULES '没有记录的规则需要撤销'; fi
     if [ "$(uci -q get uhttpd.main.error_page)" = "$CGI_URL" ]; then check_row 恢复HTTP fail REDIRECT_HANDLER_REMAINS 'error_page 仍指向插件' '检查 Web 配置回滚';
     else check_row 恢复HTTP ok REDIRECT_HANDLER_REMOVED 'Web 配置不再指向插件重定向入口'; fi
+    if redirect_running; then check_row 停用重定向服务 fail REDIRECT_STILL_RUNNING '独立重定向进程仍存在' '检查 procd 停止错误';
+    else check_row 停用重定向服务 ok REDIRECT_STOPPED '独立重定向进程已停止'; fi
+    if redirect_firewall_present || [ -n "$(uci -q get firewall.xbox_accel_redirect)" ]; then
+        check_row 撤销重定向转发 fail REDIRECT_RULES_REMAIN '专用转发规则或防火墙重载入口仍存在' '重新停用并检查清理错误';
+    else check_row 撤销重定向转发 ok REDIRECT_RULES_REMOVED '专用转发规则与重载入口已清理'; fi
     if grep -qF "$CRON_TAG" "$CRON_FILE" 2>/dev/null; then check_row 移除计划 fail CRON_REMAINS '插件计划仍存在' '检查 cron 配置写入权限';
     else check_row 移除计划 ok CRON_REMOVED '插件计划已移除'; fi
     if passwall_has_stale_rules "$previous_rules

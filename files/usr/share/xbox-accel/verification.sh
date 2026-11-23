@@ -121,7 +121,7 @@ verify_dns_row() {
 
 configuration_signature() {
     {
-        for key in enabled autostart optimize_cn optimize_com redirect_cn resolver_port dnsmasq_instance ttl isp cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval passwall_direct passwall_restart override_cdn_hosts fallback_dns redirect_ip test_url_cn test_url_com test_offset_cn test_offset_com; do
+        for key in enabled autostart optimize_cn optimize_com redirect_cn resolver_port dnsmasq_instance ttl isp cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval passwall_direct passwall_restart override_cdn_hosts fallback_dns redirect_ip redirect_port test_url_cn test_url_com test_offset_cn test_offset_com; do
             printf '%s=%s\n' "$key" "$(cfg "$key" '')"
         done
         for key in $(platform_config_keys); do printf '%s=%s\n' "$key" "$(cfg "$key" '')"; done
@@ -131,7 +131,7 @@ configuration_signature() {
         main_rules_now
         uci -q get uhttpd.main.error_page
         grep -F "$CRON_TAG" "$CRON_FILE" 2>/dev/null
-        cat /proc/sys/kernel/random/boot_id "$RESOLVER_CONF" 2>/dev/null
+        cat /proc/sys/kernel/random/boot_id "$RESOLVER_CONF" "$REDIRECT_CONF" 2>/dev/null
     } | {
         if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print "sha256:" $1}';
         elif command -v md5sum >/dev/null 2>&1; then md5sum | awk '{print "md5:" $1}';
@@ -213,7 +213,7 @@ diagnostic_environment() {
             hosts_group=$CN_DOMAINS; ip=$(best_ip cn)
         elif [ "$g" = com ] && [ "$mode" = off ]; then check_row 国际处理 skipped FEATURE_DISABLED '国际域名不处理'; continue
         elif [ "$g" = com ] && [ "$mode" = redirect ]; then
-            hosts_group="$COM_DOMAINS $COM_DL_DOMAINS"; cfg_bool override_cdn_hosts 1 && hosts_group="$hosts_group $CDN_HOSTS"; ip=$(lan_ip)
+            hosts_group="$COM_DOMAINS $COM_DL_DOMAINS"; cfg_bool override_cdn_hosts 1 && hosts_group="$hosts_group $CDN_HOSTS"; ip=$(redirect_ip)
         elif [ "$g" = com ]; then
             hosts_group=$COM_DOMAINS; cfg_bool override_cdn_hosts 1 && hosts_group="$hosts_group $CDN_HOSTS"; ip=$(best_ip com)
         else
@@ -271,13 +271,18 @@ diagnostic_environment() {
     fi
     if cfg_bool redirect_cn 0; then
         value=$(redirect_blocker)
-        if [ -n "$value" ]; then check_row 'HTTP 302' fail REDIRECT_UNAVAILABLE "$value" '满足 uhttpd HTTP 80 前置条件，或关闭此功能';
+        if [ -n "$value" ]; then check_row 'HTTP 302' fail REDIRECT_UNAVAILABLE "$value" '检查独立服务端口、专用地址和防火墙工具';
         elif [ "$enabled" = 0 ]; then check_row 'HTTP 302' skipped PLUGIN_DISABLED '未启用，不做运行验收';
         else
-            got=$(curl -sS --noproxy '*' -o /dev/null -m 3 -H 'Host: assets1.xboxlive.com' -w '%{http_code} %{redirect_url}' "http://$(lan_ip)/xbox-accel/selftest?probe=1" 2>"$work/redirect.err"); rc=$?
-            if [ "$rc" = 0 ] && [ "$got" = '302 http://assets1.xboxlive.cn/xbox-accel/selftest?probe=1' ]; then check_row 'HTTP 302' ok REDIRECT_VERIFIED '本地 HTTP 跳转及路径、查询参数已验证';
-            elif [ "$rc" != 0 ]; then check_row 'HTTP 302' unknown REDIRECT_REQUEST_FAILED "curl_exit=$rc error=$(head -c 250 "$work/redirect.err")" '检查本地 HTTP 服务和 LAN 地址';
-            else check_row 'HTTP 302' fail REDIRECT_MISMATCH "实际响应:$got" '检查 uhttpd error_page 与脚本是否生效'; fi
+            if ! redirect_running; then check_row 重定向服务 fail REDIRECT_NOT_RUNNING '独立重定向进程缺失' '检查 procd 和启动日志';
+            elif redirect_ready; then check_row 重定向服务 ok REDIRECT_RUNNING "独立进程的 127.0.0.1 与 $(lan_ip):$(redirect_port) 监听已确认";
+            else check_row 重定向服务 fail REDIRECT_LISTENER_MISSING '独立进程的 LAN 或回环监听缺失' '检查端口绑定错误与 LAN 地址'; fi
+            if redirect_firewall_ready; then check_row 重定向转发 ok REDIRECT_RULES_READY "LAN 的 $(redirect_ip):80 与路由器自测入口均有精确转发规则";
+            else check_row 重定向转发 fail REDIRECT_RULES_MISSING '转发规则与当前配置不一致' '重新应用或检查防火墙重载'; fi
+            got=$(curl -sS --noproxy '*' -o /dev/null -m 3 -H 'Host: assets1.xboxlive.com' -w '%{http_code} %{redirect_url}' "http://$(redirect_ip)/xbox-accel/selftest?probe=1" 2>"$work/redirect.err"); rc=$?
+            if [ "$rc" = 0 ] && [ "$got" = '302 http://assets1.xboxlive.cn/xbox-accel/selftest?probe=1' ]; then check_row 'HTTP 302' ok REDIRECT_VERIFIED '专用地址 80 入口、独立服务及路径查询参数已验证；LAN 客户端路径需实测';
+            elif [ "$rc" != 0 ]; then check_row 'HTTP 302' unknown REDIRECT_REQUEST_FAILED "curl_exit=$rc error=$(head -c 250 "$work/redirect.err")" '检查独立 HTTP 服务和专用地址转发';
+            else check_row 'HTTP 302' fail REDIRECT_MISMATCH "实际响应:$got" '检查独立 Web 目录中的重定向脚本'; fi
         fi
     else check_row 'HTTP 302' skipped FEATURE_DISABLED '未开启'; fi
 

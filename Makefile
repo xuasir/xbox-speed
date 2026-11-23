@@ -36,12 +36,12 @@ define Package/luci-app-xbox-accel/install
 	$(INSTALL_CONF) ./files/etc/config/xbox-accel $(1)/etc/config/
 	$(INSTALL_DIR) $(1)/usr/share/xbox-accel
 	$(CP) ./files/usr/share/xbox-accel/* $(1)/usr/share/xbox-accel/
+	$(INSTALL_BIN) ./files/usr/share/xbox-accel/redirect.cgi ./files/usr/share/xbox-accel/firewall.sh $(1)/usr/share/xbox-accel/
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd $(1)/usr/share/rpcd/acl.d $(1)/usr/share/luci/menu.d
 	$(INSTALL_BIN) ./files/usr/libexec/rpcd/xbox-accel $(1)/usr/libexec/rpcd/
 	$(INSTALL_DATA) ./files/usr/share/rpcd/acl.d/*.json $(1)/usr/share/rpcd/acl.d/
 	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/*.json $(1)/usr/share/luci/menu.d/
-	$(INSTALL_DIR) $(1)/www/cgi-bin $(1)/www/luci-static/resources/view/xbox-accel
-	$(INSTALL_BIN) ./files/www/cgi-bin/xbox-accel-redirect $(1)/www/cgi-bin/
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/xbox-accel
 	$(INSTALL_DATA) ./files/www/luci-static/resources/view/xbox-accel/*.js $(1)/www/luci-static/resources/view/xbox-accel/
 endef
 
@@ -50,6 +50,7 @@ define Package/luci-app-xbox-accel/postinst
 [ -n "$$IPKG_INSTROOT" ] && exit 0
 /etc/init.d/xbox-accel enable
 /etc/init.d/rpcd restart
+[ "$$(uci -q get xbox-accel.main.enabled)" = 1 ] && /etc/init.d/xbox-accel restart
 exit 0
 endef
 

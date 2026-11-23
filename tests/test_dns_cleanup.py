@@ -94,7 +94,7 @@ echo /assets1.xboxlive.cn/127.0.0.1#5444 > state/main_rules
 apply_lock() { :; }; cancel_task() { :; }; uniq_keep_order() { awk '!seen[$0]++'; }
 passwall_dnsmasq_confs() { :; }
 sync_main() { rm state/main_instance state/main_rules; return 1; }
-sync_uhttpd() { :; }; sync_cron() { :; }
+sync_uhttpd() { :; }; sync_redirect() { :; }; sync_cron() { :; }
 sync_passwall() { echo "sync:$1"; }
 flush_front_cache() { echo "flush:$1"; }
 ''' + cleanup_helpers() + '\n' + function('teardown') + '\nteardown; teardown\n')
@@ -193,7 +193,7 @@ echo /assets1.xboxlive.cn/127.0.0.1#5444 > state/main_rules
 apply_lock() { :; }; cancel_task() { :; }; uniq_keep_order() { awk '!seen[$0]++'; }
 passwall_dnsmasq_confs() { :; }
 sync_main() { rm -f state/main_instance state/main_rules; return 1; }
-sync_uhttpd() { :; }; sync_cron() { :; }
+sync_uhttpd() { :; }; sync_redirect() { :; }; sync_cron() { :; }
 sync_passwall() { echo "sync:$1"; return 1; }
 flush_front_cache() { echo "flush:$1"; }
 ''' + cleanup_helpers() + '\n' + function('teardown') + '''
@@ -247,7 +247,7 @@ note() { :; }; kill() { return 1; }
         self.assertEqual(output.strip(), 'result:1')
 
     def test_cleanup_failure_stages_retain_records(self):
-        for stage in ('main', 'web', 'cron', 'cache'):
+        for stage in ('main', 'web', 'redirect', 'cron', 'cache'):
             with self.subTest(stage=stage):
                 output = self.run_shell('''
 STATE_DIR=state; RUN_DIR=run; RESOLVER_CONF=resolver; DNS_INSTANCE=main
@@ -258,6 +258,7 @@ apply_lock() { :; }; cancel_task() { :; }; uniq_keep_order() { awk '!seen[$0]++'
 passwall_dnsmasq_confs() { :; }
 sync_main() { [ "$FAIL_STAGE" != main ] && return 1; return 2; }
 sync_uhttpd() { [ "$FAIL_STAGE" != web ]; }
+sync_redirect() { [ "$FAIL_STAGE" != redirect ]; }
 sync_cron() { [ "$FAIL_STAGE" != cron ]; }
 sync_passwall() { :; }
 flush_front_cache() { [ "$FAIL_STAGE" != cache ]; }

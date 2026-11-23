@@ -24,7 +24,7 @@ BASE_VERSION_RE = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
 VERSION_RE = re.compile(BASE_VERSION_RE + r'(?:~beta\.[1-9][0-9]*\.g[0-9a-f]{7,40})?')
 EXECUTABLES = {
     'usr/bin/xbox-accel', 'etc/init.d/xbox-accel',
-    'www/cgi-bin/xbox-accel-redirect', 'usr/libexec/rpcd/xbox-accel',
+    'usr/share/xbox-accel/redirect.cgi', 'usr/share/xbox-accel/firewall.sh', 'usr/libexec/rpcd/xbox-accel',
 }
 CONFFILES = ['/etc/config/xbox-accel']
 

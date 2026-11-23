@@ -105,7 +105,7 @@ sh install.sh
 ### 高级设置
 
 - 备用 CDN / SRV 接管、Passwall 直连集合、必要时重启 Passwall。
-- 主 dnsmasq 实例、独立解析端口、TTL、备用上游、重定向 LAN IP、可替换的测试 URL。
+- 主 dnsmasq 实例、独立解析端口、TTL、备用上游、重定向专用地址及服务端口、可替换的测试 URL。
 - 更换主 dnsmasq 实例前，先停用并保存，撤销旧实例规则。
 - 备用上游只允许公网 IPv4，不能填写本机或回指主 DNS，防止循环解析。
 
@@ -142,14 +142,21 @@ sh install.sh
 
 ## 5. com→cn 条件与限制
 
-重定向使用现有 uhttpd 的 HTTP 404 CGI 入口，不新建独立 HTTP 代理，也不承载整个游戏包。
+开启重定向后，procd 同时管理独立解析与重定向实例。独立 uhttpd 默认监听 `127.0.0.1:18081` 和 `LAN_IP:18081`，Web 根目录为 `/var/etc/xbox-accel/redirect`。主 uhttpd 保留原有端口、HTTPS 跳转与过滤配置；LuCI 页面及文件继续由主服务提供。重定向服务返回 302，游戏内容由客户端直接从国内 CDN 下载。
 
-- uhttpd main 必须监听 HTTP 80，且未强制跳转 HTTPS。
-- 自动为明确接管的下载域名添加重绑定例外，允许返回路由器内网 IP；**不关闭全局 DNS 重绑定保护**。
-- 只有 HTTP 可用；HTTPS 的证书验证不能被普通 302 服务绕过。本插件不伪造证书、不关闭证书校验。
-- 如果下载路径恰好在路由器 Web 根目录中真实存在，404 CGI 不会触发。
-- 国内资源不可用或过慢时，没有逐游戏自动回退功能，需要关闭 com→cn。
-- 不擅自调整 LuCI 管理端口、不开放 WAN 防火墙、不全局关闭 IPv6。
+```text
+国际下载域名 → DNS 返回 192.0.2.1
+→ LAN 发往 192.0.2.1:80 的请求转入独立服务 18081
+→ HTTP 302 → 客户端访问国内 CDN
+```
+
+“高级”页提供 `redirect_ip`（默认 `192.0.2.1`）与 `redirect_port`（默认 `18081`）。专用虚拟地址需位于直连网段及现有专用路由之外，监听端口需在 `1024..65535` 且与解析端口分开。启用前检查地址及端口占用，参数错误会保留现有运行配置并返回错误。
+
+- **下载设备需经插件所在路由器到达专用地址**。主路由部署可使用默认值；旁路由部署需在客户端或主路由配置 `192.0.2.1/32` 的下一跳为旁路由 LAN 地址。专用地址由 DNS 和转发规则使用。
+- nftables 使用插件自己的 IPv4 表，iptables 使用专用 PREROUTING / OUTPUT 链；规则精确匹配 LAN 设备、专用地址与 TCP 80。防火墙重载入口自动恢复规则，健康检查也会检查重定向进程和转发状态。开启 Passwall 自动直连同步时，专用地址也加入直连集合；手动分流时将该地址设为本地直连。
+- 适用于 HTTP 下载；HTTPS 保持原有证书验证。国内资源不可用或过慢时，关闭 com→cn 后按国际 CDN 优选设置处理。DNS 重绑定保护继续启用，例外限定在插件接管的下载域名；IPv6 处理限定在已固定域名。
+
+独立实例随功能开启而启动，异常退出由 procd 重新拉起。关闭重定向或总开关会撤销专用转发与防火墙重载入口；停止服务会核查实际进程的二进制与 Web 根目录，兼容 PID 文件遗失或错误。升级时恢复旧版保存的主 uhttpd 404 配置，并将旧版路由器地址语义迁移为专用地址；后续启停仅管理独立入口。
 
 ## 6. 与 Passwall / ChinaDNS 共存
 
@@ -215,7 +222,8 @@ sh install.sh purge     # 同时清除配置与记录
 - `.ipk` 由 opkg 在新容器安装，自动安装依赖，默认未改 DNS / Web 配置。
 - LuCI JS 替身测试：渲染、表单参数、纯文本日志、按钮状态、等待 UCI 提交后应用。
 - 真实 Chrome + 真实 LuCI：登录、页面与环境 RPC 加载、自启动开关、每天/每周/每月计划与时间、原生“保存并应用”持久提交、恢复配置并截图。
-- CGI 四项回归：路径查询串、旧域名、未知域名、CR/LF 响应头注入拒绝。
+- CGI 回归：路径查询串、旧域名、未知域名、控制字符与响应头注入检查；独立 Web 目录的真实 HTTP 请求覆盖根路径及 LuCI 同名路径。
+- 独立重定向回归：真实 DNS / 302、LAN 客户端转发、主服务 HTTPS 与端口设置、端口及地址变更、procd 异常恢复、防火墙重载、PID 遗失、参数及端口冲突、旧版配置迁移、同名规则所有权，以及 nftables / iptables 清理。
 - 诊断回归：curl 传输/HTTP 分类、IPv6/MAC/URL 认证信息脱敏、导出排队等待与历史日志标记；OpenWrt 容器注入部分测速失败、异常记录、DNS 冲突、完整域名/SRV/AAAA 验收、较大报告导出、防火墙全部/部分读取失败、零速度、运行中及排队取消、重启后日志读取、持久写入失败和空/缺失的 Passwall 集合。
 - 十一项可重复的 OpenWrt 集成测试：模拟 CDN 选优与失败保留，实际 DNS A / AAAA / SRV，启停回滚，受限 RPC，任务重启取消，锁释放，健康检查规则修复，日志轮转，cron 校验，未知 DNS 重定向检测，更新 IP 后刷新主 DNS 缓存，日/周/月计划，启动钩子，以及运行中 DNS 副本的停用清理。DNS 副本测试使用真实 dnsmasq 与模拟的 Passwall 重载脚本。
 
@@ -245,8 +253,10 @@ python3 tests/test_service_locks.py
 python3 tests/test_schedule_startup.py
 python3 tests/test_diagnostics.py
 python3 tests/test_cgi.py
+python3 tests/test_redirect.py
 # 只在可丢弃的 Docker OpenWrt 容器运行，绝不可指向主力设备：
-python3 tests/test_cgi_openwrt.py xa-test  # BusyBox CGI、真实 302 与 LuCI 共存
+python3 tests/test_cgi_openwrt.py xa-test  # BusyBox CGI、独立 HTTP 与 LuCI 共存
+python3 tests/test_redirect_openwrt.py xa-test  # 专用入口、LAN 客户端、启停与迁移
 python3 tests/test_openwrt.py xa-test
 python3 tests/test_service_stop_openwrt.py xa-test  # 服务锁超时、清理失败、PID 文件异常
 python3 tests/test_diagnostics_openwrt.py xa-test

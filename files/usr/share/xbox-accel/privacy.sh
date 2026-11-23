@@ -74,7 +74,7 @@ build_redacted_report() {
         json_append_document current_checks "$checks"
         json_append_document last_application "$(application_report_document)"
         json_add_object configuration
-        for key in enabled autostart optimize_cn optimize_com redirect_cn isp resolver_port dnsmasq_instance ttl cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval log_mode quick_size_mb quick_time full_size_mb full_time max_candidates top_n switch_threshold passwall_direct passwall_restart override_cdn_hosts; do
+        for key in enabled autostart optimize_cn optimize_com redirect_cn redirect_ip redirect_port isp resolver_port dnsmasq_instance ttl cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval log_mode quick_size_mb quick_time full_size_mb full_time max_candidates top_n switch_threshold passwall_direct passwall_restart override_cdn_hosts; do
             json_add_string "$key" "$(cfg "$key" '')"
         done
         for key in $(platform_config_keys); do json_add_string "$key" "$(cfg "$key" '')"; done

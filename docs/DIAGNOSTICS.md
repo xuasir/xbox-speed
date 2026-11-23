@@ -41,6 +41,10 @@ curl 错误同时记录 HTTP、退出码、字节、耗时和原始错误摘要�
 | `FIREWALL_UNREADABLE` / `FIREWALL_PARTIAL_READ` | 检查工具与读取权限，当前入口状态待确认 |
 | `SERVICE_TIMEOUT` | 检查 `ps w` 与服务锁持有进程；旧版锁泄漏按[恢复步骤](UPGRADE_LOCK_RECOVERY.md)处理 |
 | `SERVICE_STOP_INCOMPLETE` | 根据实际解析进程的二进制、配置路径和状态检查停用结果 |
+| `REDIRECT_UNAVAILABLE` | 检查独立服务端口、专用 IPv4、LAN 地址以及 nftables / iptables |
+| `REDIRECT_NOT_RUNNING` / `REDIRECT_LISTENER_MISSING` / `REDIRECT_RULES_MISSING` | 检查独立 uhttpd、LAN 与回环监听及专用转发，重新应用配置 |
+| `REDIRECT_REQUEST_FAILED` / `REDIRECT_MISMATCH` | 检查专用地址 80 入口、独立 Web 目录及实际 302 响应 |
+| `REDIRECT_STILL_RUNNING` / `REDIRECT_RULES_REMAIN` | 根据进程身份和规则所有权检查停用清理，处理错误后重试 |
 
 `/etc/init.d/xbox-accel stop`、`shutdown`、`disable` 默认期限为 60 秒，启动、重启、重载和开机恢复为 120 秒；超时清理可能额外耗时约 1 秒。停止后会查验实际解析进程，覆盖 procd 注册信息与 PID 文件遗失的情况。服务清理错误会保留失败退出码，重启在停止失败时中止。
 
@@ -51,6 +55,10 @@ curl 错误同时记录 HTTP、退出码、字节、耗时和原始错误摘要�
 验收分别汇总路由器链路、测试资源、直连集合，另列实际流量与 Xbox 待确认状态。资源校验失败或直连集合缺少应有节点会进入任务失败结果；查询超时等未知项进入部分完成结果。
 
 启用的下载域名、四个备用 CDN 和三个 SRV 名称会按当前模式逐项检查。独立解析实例、主 DNS 和最多三个已识别的 DNS 重定向入口分别查询 A、AAAA、SRV，每项展示预期与实际值。超过入口上限、DNAT 目标待解析、域名兼容性失败以及功能关闭均明确列出范围。
+
+com→cn 使用独立 uhttpd，默认服务端口 `18081`，专用虚拟地址 `192.0.2.1`。初查分别检查参数、进程与转发规则；完整验收从路由器访问专用地址的 80 入口，核对 302、国内目标及原始路径和查询参数。OUTPUT 自测与 LAN PREROUTING 规则分别检查，LAN 客户端的实际路由需额外确认。旁路由部署应将专用地址的下一跳指向插件所在设备。
+
+防火墙重载会通过插件持有的 include 恢复专用规则；应用锁已被配置操作持有时，重载入口立即返回，由正在执行的应用操作完成恢复。停用验收核对独立进程、专用转发和重载入口均已清理；旧版主 uhttpd 的 404 配置恢复仍保留清理失败记录供重试。
 
 新平台按域名验证各自的资源。Switch 默认映射的三个游戏下载域名参加完整 A/AAAA 验收；游戏资源增强校验为可选项，留空时记录 `OPTIONAL_GAME_RESOURCE` 并跳过资源请求。填写链接后独立验证实际游戏资源，路径或签名改变会使旧摘要失效；失败域名走上游，删除链接后恢复默认映射。公开资源可用性、默认 DNS 映射与实际游戏资源验证分别表达，设备实际效果由客户端确认。商店接口获取失败与 CDN 资源验证失败分别记录。平台配置、节点、Switch 接管域名与验证摘要参与配置签名，历史验收结果据此判断适用时刻。
 

@@ -5,7 +5,7 @@ import pathlib
 import subprocess
 import unittest
 
-CGI = pathlib.Path(__file__).resolve().parents[1] / 'files/www/cgi-bin/xbox-accel-redirect'
+CGI = pathlib.Path(__file__).resolve().parents[1] / 'files/usr/share/xbox-accel/redirect.cgi'
 
 class RedirectTests(unittest.TestCase):
     def run_cgi(self, host, uri):

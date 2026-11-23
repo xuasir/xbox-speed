@@ -22,6 +22,7 @@ String.prototype.format = function(...args) {
 const status = {
 	version: '0.2.0', enabled: true, running: true, testing: false, mode: 'redirect', optimize_cn: true,
 	lan_ip: '192.168.1.1', cn_ip: '1.2.3.4', cn_speed: '10.00 MB/s（80 Mbps）', cn_time: 1700000000,
+	redirect_ip: '192.0.2.1', redirect_port: '18081', redirect_running: true,
 	com_ip: '', log: '<script>alert(1)</script>'
 };
 const environment = { environment: [ { name: '解析', level: 'fail', detail: '<b>x</b>' }, { name: '系统', level: 'info', detail: 'OpenWrt' } ] };
@@ -182,7 +183,7 @@ const v = new Function('view', 'form', 'uci', 'rpc', 'poll', 'ui', 'dom', 'E', '
 	const names = options.map(o => o.name);
 	for (const n of [ 'enabled', 'autostart', 'optimize_cn', 'optimize_com', 'redirect_cn', 'isp', 'schedule_type', 'schedule_time', 'schedule_weekday', 'schedule_monthday', 'health_interval',
 		'switch_threshold', 'max_candidates', 'quick_size_mb', 'quick_time', 'top_n', 'full_size_mb', 'full_time',
-		'override_cdn_hosts', 'passwall_direct', 'passwall_restart', 'dnsmasq_instance', 'resolver_port', 'ttl', 'fallback_dns', 'log_mode' ])
+		'override_cdn_hosts', 'passwall_direct', 'passwall_restart', 'dnsmasq_instance', 'resolver_port', 'redirect_ip', 'redirect_port', 'ttl', 'fallback_dns', 'log_mode' ])
 		assert(names.includes(n), 'missing option ' + n);
 	for (const group of ['store','ps','xbox_old','switch']) {
 		assert.strictEqual(options.find(o=>o.name==='optimize_'+group).default, '0');
