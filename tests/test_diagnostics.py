@@ -63,5 +63,76 @@ class ErrorClassificationTests(unittest.TestCase):
         self.assertIn(result['expected'], result['log'])
 
 
+class LogModeTests(unittest.TestCase):
+    def events(self, mode):
+        return subprocess.run(['sh', '-c', '''
+            . "$1"
+            LOG_MODE=$2
+            stamp() { echo fixed; }
+            system_log() { :; }
+            task_event DEBUG DNS_MATCH 'matched'
+            task_event INFO OK 'sample'
+            task_event INFO STAGE_SUMMARY 'samples=2 valid=2'
+            task_event INFO NODE_SELECTED 'selected_ip=9.9.9.9'
+            task_event WARN CONNECT_FAILED 'url=http://host/path?secret=value'
+            task_event ERROR CONFIG_INVALID 'bad config'
+            task_event INFO TASK_FINAL 'status=success'
+        ''', 'logging-test', str(LIB), mode], text=True, capture_output=True, check=True).stderr
+
+    def test_concise_keeps_results_and_errors(self):
+        log = self.events('concise')
+        self.assertEqual(len(log.splitlines()), 5)
+        for code in ['STAGE_SUMMARY', 'NODE_SELECTED', 'CONNECT_FAILED', 'CONFIG_INVALID', 'TASK_FINAL']:
+            self.assertIn(f'[{code}]', log)
+        self.assertNotIn('[DEBUG]', log)
+        self.assertNotIn('[OK]', log)
+        self.assertNotIn('secret=value', log)
+
+    def test_detail_keeps_individual_events(self):
+        log = self.events('detail')
+        self.assertEqual(len(log.splitlines()), 7)
+        self.assertIn('[DEBUG][DNS_MATCH]', log)
+        self.assertIn('[INFO][OK]', log)
+        self.assertNotIn('secret=value', log)
+
+    def test_suppressed_events_skip_formatting(self):
+        result = subprocess.run(['sh', '-c', '''
+            . "$1"
+            safe_text() { echo unexpected-formatting >&2; }
+            stamp() { echo unexpected-timestamp >&2; }
+            task_event DEBUG DNS_MATCH 'matched'
+            task_event INFO OK 'sample'
+        ''', 'logging-test', str(LIB)], text=True, capture_output=True, check=True)
+        self.assertEqual(result.stdout + result.stderr, '')
+
+    def test_display_filters_history_and_keeps_raw_log(self):
+        result = subprocess.check_output(['sh', '-c', '''
+            . "$1"
+            diagnostic_log() {
+                printf '%s\\n' '[id][stage][DEBUG][DNS_MATCH] matched' '[id][stage][INFO][OK] sample' \\
+                    '[id][stage][INFO][NODE_SELECTED] ip' '[id][stage][WARN][TIMEOUT] timeout' 'legacy line'
+            }
+            display_log
+            diagnostic_log
+        ''', 'logging-test', str(LIB)], text=True).splitlines()
+        self.assertEqual(result[:3], ['[id][stage][INFO][NODE_SELECTED] ip', '[id][stage][WARN][TIMEOUT] timeout', 'legacy line'])
+        self.assertEqual(len(result), 8, '原始日志仍保留全部诊断行供导出')
+
+    def test_legacy_cli_rows_keep_anomalies_and_expected_values(self):
+        log = subprocess.check_output(['sh', '-c', '''
+            . "$1"
+            diagnostic_log() {
+                printf '%s\\n' '11-20 10:00:00 [ 正常 ] [DNS_MATCH] matched' \\
+                    '11-20 10:00:00   预期=9.9.9.9；实际=9.9.9.9' \\
+                    '11-20 10:00:00 [ 异常 ] [DNS_MISMATCH] mismatch' \\
+                    '11-20 10:00:00   预期=9.9.9.9；实际=1.2.3.4'
+            }
+            display_log
+        ''', 'logging-test', str(LIB)], text=True)
+        self.assertEqual(len(log.splitlines()), 2)
+        self.assertIn('DNS_MISMATCH', log)
+        self.assertIn('预期=9.9.9.9；实际=1.2.3.4', log)
+
+
 if __name__ == '__main__':
     unittest.main()

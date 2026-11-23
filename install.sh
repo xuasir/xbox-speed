@@ -13,6 +13,11 @@ FILES="
 /www/cgi-bin/xbox-accel-redirect
 /usr/share/xbox-accel/seeds.cn
 /usr/share/xbox-accel/seeds.com
+/usr/share/xbox-accel/seeds.store
+/usr/share/xbox-accel/seeds.ps
+/usr/share/xbox-accel/seeds.xbox_old
+/usr/share/xbox-accel/seeds.switch
+/usr/share/xbox-accel/platforms.sh
 /usr/share/xbox-accel/ecs.telecom
 /usr/share/xbox-accel/ecs.unicom
 /usr/share/xbox-accel/ecs.mobile
@@ -103,6 +108,7 @@ echo "== 依赖"
 echo "  dnsmasq：$(/usr/sbin/dnsmasq -v | awk 'NR==1{print $3}')"
 command -v flock >/dev/null 2>&1 || { echo "  缺少 flock（通常由 BusyBox 提供）" >&2; exit 1; }
 need "curl" "command -v curl" curl
+need "HTTPS CA 证书" "test -s /etc/ssl/certs/ca-certificates.crt" ca-bundle
 need "jshn" "test -f /usr/share/libubox/jshn.sh" jshn
 need "rpcd" "test -x /sbin/rpcd" rpcd
 need "LuCI" "test -f /www/luci-static/resources/luci.js" luci-base

@@ -27,6 +27,23 @@ var COM_MODES = {
 	off: '不处理'
 };
 
+var PLATFORMS = [
+	{id:'store', label:'微软商店', hosts:['dl.delivery.mp.microsoft.com','tlu.dl.delivery.mp.microsoft.com','1d.tlu.dl.delivery.mp.microsoft.com']},
+	{id:'ps', label:'PlayStation', hosts:['gst.prod.dl.playstation.net','gs2.ww.prod.dl.playstation.net','zeus.dl.playstation.net','ares.dl.playstation.net']},
+	{id:'xbox_old', label:'Xbox 老游戏下载', hosts:['dlassets.xboxlive.cn','dlassets2.xboxlive.cn']},
+	{id:'switch', label:'Switch', hosts:['ctest-dl-lp1.cdn.nintendo.net','ctest-dl.p01.lp1.ctest.srv.nintendo.net','atum.hac.lp1.d4c.nintendo.net','nemof.p01.lp1.nemo.srv.nintendo.net','nemof.hac.lp1.nemo.srv.nintendo.net']}
+];
+var GROUP_LABELS = {cn:'Xbox 国内',com:'Xbox 国际',store:'微软商店',ps:'PlayStation',xbox_old:'Xbox 老游戏下载',switch:'Switch'};
+
+function validatePlatformUrl(platform, value, games) {
+	if (!value) return true;
+	var match = /^https?:\/\/([^/]+)\/[^\s#\\]+$/.exec(value);
+	var hosts = games ? platform.hosts.slice(2) : platform.hosts;
+	if (value.length > 4096 || /[\s\x00-\x1f\x7f]/.test(value) || !match || hosts.indexOf(match[1]) === -1)
+		return '请填写该平台下载域名下的 HTTP(S) 资源链接，使用默认端口并保留完整路径和参数';
+	return true;
+}
+
 function formatTime(epoch) {
 	if (!epoch)
 		return '';
@@ -57,9 +74,9 @@ function taskText(task, detailed) {
 	var text = (TASK_TYPES[task.kind] || '任务') + '：' + (TASK_STATES[task.status] || '未知') + ' [' + (task.code || '?') + ']；ID=' + (task.id || '?') + '；阶段=' + (task.stage || '?');
 	if(detailed===false) return text;
 	text += '；' + (task.message || '');
-	if (task.groups && (task.kind==='test' || task.kind==='health')) ['cn','com'].forEach(function(group){
+	if (task.groups && (task.kind==='test' || task.kind==='health')) ['cn','com','store','ps','xbox_old','switch'].forEach(function(group){
 		var result=task.groups[group];
-		if(result) text += '；' + (group==='cn'?'国内':'国际') + '=' + (TASK_STATES[result.status] || result.status) + ' [' + result.code + '] ' + result.message;
+		if(result) text += '；' + GROUP_LABELS[group] + '=' + (TASK_STATES[result.status] || result.status) + ' [' + result.code + '] ' + result.message;
 	});
 	if(task.application) text += '；配置=' + (APPLY_STATES[task.application.status] || '未知') + ' [' + task.application.code + ']';
 	if(task.started_text) text += '；开始=' + task.started_text;
@@ -94,6 +111,8 @@ return view.extend({
 		});
 		this.buttons = {};
 		this.wasTesting = false;
+		this.environmentGroups = {};
+		this.nextStatusPoll = 0;
 
 		var button = function(label, command, style, confirmText) {
 			self.buttons[command] = E('button', {
@@ -110,12 +129,13 @@ return view.extend({
 		};
 
 		var m = new form.Map('xbox-accel', 'Xbox 下载加速',
-			'让 Xbox 的游戏下载连接到对当前线路最快的 CDN 节点，并可把国际下载地址重定向到国内下载地址。' +
-			'本插件本身不代理下载流量；是否直连还取决于 Passwall 等软件的分流规则。');
+			'按平台选择当前线路的下载 CDN 节点，支持 Xbox、微软商店、PlayStation 和 Switch。' +
+			'Xbox 可将国际下载地址重定向到国内；实际下载路径还取决于 Passwall 等软件的分流规则。');
 
 		var s = m.section(form.NamedSection, 'main', 'main');
 		s.addremove = false;
 		s.tab('basic', '基本设置');
+		s.tab('platforms', '平台下载');
 		s.tab('test', '自动测速');
 		s.tab('advanced', '高级设置');
 		s.tab('environment', '环境检测');
@@ -143,13 +163,49 @@ return view.extend({
 			'关闭后会撤销本插件对主 dnsmasq、uhttpd 和计划任务所做的全部改动。');
 		flag('basic', 'autostart', '开机自启动', '1',
 			'路由器启动后自动恢复已启用的加速功能。关闭此项后，重启时只清理旧规则；可在页面重新应用以手动启动。总开关关闭时不会自启动。');
-		flag('basic', 'optimize_cn', '国内 CDN 优选', '1',
+		flag('platforms', 'optimize_cn', '国内 CDN 优选', '1',
 			'把 assets1.xboxlive.cn 等国内下载域名指向测速最快的节点。');
-		flag('basic', 'optimize_com', '国际 CDN 优选', '1',
+		flag('platforms', 'optimize_com', '国际 CDN 优选', '1',
 			'把 assets1.xboxlive.com 等国际下载域名指向测速最快的节点。');
-		flag('basic', 'redirect_cn', '国际下载重定向到国内（com→cn）', '0',
+		flag('platforms', 'redirect_cn', '国际下载重定向到国内（com→cn）', '0',
 			'把发往国际下载域名的请求用 HTTP 302 转到国内域名，开启后国际域名不再做 CDN 优选。' +
 			'需要路由器的 uhttpd 在 80 端口提供 HTTP。个别游戏在国内 CDN 上可能很慢或无法下载，遇到时请关闭此项。');
+
+		PLATFORMS.forEach(function(platform) {
+			var description = '独立发现、测速和保存该平台的节点，启用后参加定时测速与健康检查。';
+			if (platform.id === 'store') description += '测速链接会在临近过期时自动刷新。';
+			if (platform.id === 'xbox_old') description += '优选 dlassets.xboxlive.cn 与 dlassets2.xboxlive.cn，可与 Xbox 国际重定向配合。';
+			if (platform.id === 'switch') description += '公开测速通过后，atum/nemof 游戏下载域名默认使用选中节点；可选游戏链接用于增强资源校验。';
+			flag('platforms', 'optimize_' + platform.id, platform.label + ' CDN 优选', '0', description);
+			if (platform.id === 'store') {
+				o = s.taboption('platforms', form.ListValue, 'store_test_app', '商店测速应用');
+				o.value('store', '微软商店应用'); o.value('xbox', 'Xbox 应用');
+				o.default = 'store'; o.rmempty = false; o.depends('optimize_store', '1');
+			}
+			o = s.taboption('platforms', form.Value, 'test_url_' + platform.id, platform.label + '测速链接',
+				platform.id === 'store' ? '留空时自动获取签名链接。手动链接请保留有效期与签名参数。' :
+				platform.id === 'switch' ? '留空使用内置 30 MiB 公开下载测试资源，选中节点默认用于游戏下载域名。' : '留空使用内置测速资源。');
+			o.optional = true; o.depends('optimize_' + platform.id, '1');
+			o.placeholder = platform.id === 'ps' ? 'http://gst.prod.dl.playstation.net/networktest/get_192m' :
+				platform.id === 'switch' ? 'http://ctest-dl-lp1.cdn.nintendo.net/30m' : '留空使用内置资源';
+			o.validate = function(section_id, value) {
+				var result = validatePlatformUrl(platform, value, false);
+				if (result === true && value && platform.id === 'switch' && platform.hosts.slice(0,2).indexOf(value.match(/^https?:\/\/([^/]+)/)[1]) === -1)
+					return '公开测速链接请使用 ctest 下载域名；游戏链接填写在独立校验列表';
+				return result;
+			};
+			if (platform.id === 'ps' || platform.id === 'switch') {
+				o = s.taboption('platforms', form.DynamicList, 'verification_urls_' + platform.id,
+					platform.id === 'switch' ? 'Switch 游戏下载校验链接（可选）' : 'PlayStation 分域名校验链接',
+					platform.id === 'switch' ? '留空采用默认节点映射。填写 atum 或 nemof 实际游戏链接后，保存应用会增强校验对应域名；校验失败时该域名使用上游解析。路径或签名变更后重新校验，删除链接后恢复默认映射。最多 8 条，每个域名使用第一条链接。' :
+						'gst、gs2 和 zeus 已有独立资源；可按域名覆盖或补充 ares 的实际资源。最多 8 条，每个域名使用第一条链接。');
+				o.optional = true; o.depends('optimize_' + platform.id, '1');
+				o.validate = function(section_id, value) { return validatePlatformUrl(platform, value, platform.id === 'switch'); };
+			}
+			o = s.taboption('platforms', form.DynamicList, 'extra_ips_' + platform.id, platform.label + '额外候选 IP',
+				'可选公网 IPv4；与自动发现的节点一起测速。');
+			o.optional = true; o.datatype = 'ip4addr'; o.depends('optimize_' + platform.id, '1');
+		});
 
 		o = s.taboption('basic', form.ListValue, 'isp', '运营商');
 		o.value('auto', '自动（只按当前线路发现节点）');
@@ -216,7 +272,7 @@ return view.extend({
 		number('test', 'top_n', '复测：取初筛的前几名', '3', 1, 10);
 		number('test', 'full_size_mb', '复测：每个节点最多下载（MB）', '64', 1, 256);
 		number('test', 'full_time', '复测：每个节点最长时间（秒）', '10', 1, 60,
-			'按默认值，一次完整测速最多消耗约 1 GB 流量，通常远低于此。');
+			'每组流量上限约为“候选数 × 初筛大小 +（复测前几名 + 1）× 复测大小”；启用的平台组累加。');
 
 		flag('advanced', 'override_cdn_hosts', '接管备用 CDN', '1',
 			'Xbox 会通过 SRV 记录获取另外 4 个备用 CDN 主机名并改用它们下载。开启后这些主机名也按上面的设置处理，否则下载中途可能切回未优化的节点。');
@@ -273,7 +329,7 @@ return view.extend({
 		o.render = function() {
 			return E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-descr' }, [
-					'默认显示快速环境初查；一键完整验收会在后台逐项验证 DNS/SRV/AAAA/302、测试资源和直连集合。Xbox 实际路径与速度需在主机上观察。'
+					'默认显示快速环境初查；一键完整验收会在后台逐项验证 DNS/SRV/AAAA/302、平台资源和直连集合。客户端实际路径与速度需在对应设备上观察。'
 				]),
 				self.envNode,
 				E('div', { 'style': 'margin-top:.5em' }, [
@@ -290,13 +346,20 @@ return view.extend({
 			]);
 		};
 
+		o = s.taboption('logs', form.ListValue, 'log_mode', '日志模式',
+			'简洁模式保留任务与阶段摘要、节点变更、告警及错误；同阶段同类采样失败保留首个样本并汇总次数。详细模式记录每次采样和逐域名验收。保存并应用后生效。');
+		o.value('concise', '简洁（推荐日常运行）');
+		o.value('detail', '详细（排查问题）');
+		o.default = 'concise';
+		o.rmempty = false;
+
 		o = s.taboption('logs', form.DummyValue, '_logs');
 		o.write = function() {};
 		o.remove = function() {};
 		o.render = function() {
 			return E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-descr' }, [
-					'日志包含任务 ID、阶段和错误代码，页面显示最近 300 行。任务结束时保存最多 500 行、128 KiB 的日志快照和任务摘要；异常退出会显示中断状态。'
+					'页面显示最近 300 行。简洁模式下，正常健康检查的摘要与日志保存在内存；出现告警、配置修复或完成其他任务时，保存任务摘要及最多 500 行、128 KiB 的日志快照。'
 				]),
 				self.logNote,
 				self.taskDetails,
@@ -309,6 +372,8 @@ return view.extend({
 		this.updateEnvironment(data[2] || {});
 
 		poll.add(function() {
+			if (Date.now() < self.nextStatusPoll)
+				return Promise.resolve();
 			return callStatus().then(function(status) {
 				self.updateStatus(status);
 			}).catch(function(err){self.updateStatus({status_error:err.message});});
@@ -328,7 +393,10 @@ return view.extend({
 						button('重启服务', 'restart'), ' ',
 						button('清除测速结果', 'reset', 'cbi-button-negative',
 							'清除后下载域名恢复默认解析，直到下一次测速完成。确定要清除吗？')
-					])
+					]),
+					E('div', { 'style': 'margin-top:.5em' }, PLATFORMS.reduce(function(nodes, platform) {
+						return nodes.concat([button('只测' + platform.label, 'test_' + platform.id), ' ']);
+					}, []))
 				]),
 				formNode
 			]);
@@ -364,12 +432,25 @@ return view.extend({
 			[ '服务', service ],
 			[ '国内下载域名', invalid ? '未知（未取得有效状态）' : status.optimize_cn ? nodeText(status.cn_ip, status.cn_speed, status.cn_time) : '不处理' ],
 			[ '国际下载域名', com ],
+		];
+		PLATFORMS.forEach(function(platform) {
+			var state = status.platforms && status.platforms[platform.id];
+			var text = invalid || !state ? '平台状态待确认' : !state.enabled ? '已关闭' : nodeText(state.ip, state.speed, state.time);
+			if (!invalid && state && state.enabled && platform.id === 'switch') {
+				var mapped = state.game_mapped == null ? '待确认' : state.game_mapped + '/' + (state.game_total || 3);
+				var defaults = state.game_default_mapped == null ? '待确认' : state.game_default_mapped;
+				text = '公开测速：' + text + '；游戏下载域名：已准备 ' + mapped + '（默认映射 ' + defaults + '）；增强校验：' +
+					(state.game_configured > 0 ? state.game_verified + '/' + state.game_configured : '可选');
+			}
+			rows.push([platform.label, text]);
+		});
+		rows = rows.concat([
 			[ '版本', status.version || '未知' ],
 			[ '最近完整测速', taskText(status.last_test, false) ],
 			[ '最近活动', taskText(status.last_task, false) ],
 			[ '最近完整验收', status.last_application && status.last_application.status!=='none' ? (APPLY_STATES[status.last_application.status] || '未知') + '；资源=' + (APPLY_STATES[status.last_application.measurement] || '未确认') + '；直连集合=' + (APPLY_STATES[status.last_application.direct_set] || '未确认') + '；检查时间=' + formatTime(status.last_application.checked_at) + (status.last_application.stale ? '；历史记录，当前状态需重验' : '；对应检查时刻') : '尚无验收记录' ],
-			[ 'Xbox 实际效果', '未观测；需要在主机上对比真实目标节点和稳定下载速度' ]
-		];
+			[ '客户端实际效果', '待设备观测：对比实际目标节点和稳定下载速度' ]
+		]);
 
 		dom.content(this.statusNode, rows.map(function(row) {
 			return E('tr', { 'class': 'tr' }, [
@@ -378,11 +459,13 @@ return view.extend({
 			]);
 		}));
 
-		dom.content(this.taskDetails, [E('h4',{},['持久任务摘要（与下方临时日志分开）']),
+		dom.content(this.taskDetails, [E('h4',{},['任务摘要']),
 			E('pre',{style:'white-space:pre-wrap'},['最近完整测速：'+taskText(status.last_test)+'\n最近活动：'+taskText(status.last_task)])]);
 
 		var log = typeof status.log==='string' ? status.log : this.logNode.value;
 		this.logNote.textContent = status.log_source==='persisted' ? '正在显示上次任务结束时保存的历史日志快照。' : status.log_source==='live' ? '正在显示本次开机后的运行日志。' : invalid ? '状态读取失败，保留已显示的日志。' : '尚无运行日志。';
+		if (!invalid)
+			this.logNote.textContent += status.log_mode === 'detail' ? ' 当前采集模式：详细。' : ' 当前采集模式：简洁。';
 
 		if (this.logNode.value != log) {
 			var atBottom = this.logNode.scrollTop + this.logNode.clientHeight >= this.logNode.scrollHeight - 20;
@@ -395,8 +478,11 @@ return view.extend({
 
 		var task = status.last_task;
 		var testing = !!status.testing || !!(task && (task.status==='queued' || task.status==='running'));
+		var stable = !invalid && !testing && (!status.enabled || status.running) &&
+			(!task || ['none', 'success', 'skipped'].indexOf(task.status) !== -1);
+		this.nextStatusPoll = Date.now() + (stable ? 30000 : 5000);
 
-		[ 'test', 'test_cn', 'test_com', 'reset', 'apply', 'restart', 'verify', 'export' ].forEach(L.bind(function(name) {
+		[ 'test', 'test_cn', 'test_com', 'test_store', 'test_ps', 'test_xbox_old', 'test_switch', 'reset', 'apply', 'restart', 'verify', 'export' ].forEach(L.bind(function(name) {
 			if (this.buttons[name])
 				this.buttons[name].disabled = testing;
 		}, this));
@@ -421,7 +507,8 @@ return view.extend({
 	},
 
 	updateEnvironment: function(result) {
-		var rows = (result.environment || []).map(function(item) {
+		var self = this, groups = {}, entries = [];
+		var renderRow = function(item) {
 			var level = LEVELS[item.level] || LEVELS.info;
 
 			return E('tr', { 'class': 'tr' }, [
@@ -429,6 +516,43 @@ return view.extend({
 				E('td', { 'class': 'td left', 'style': 'width:4em; white-space:nowrap; font-weight:bold; color:' + level[1] }, [ level[0] ]),
 				E('td', { 'class': 'td left' }, [ (item.code ? '['+item.code+'] ' : '') + (item.detail || ''), item.expected ? E('div',{},['预期：'+item.expected+'；实际：'+(item.observed||'无结果')]) : '', item.remediation ? E('div',{},['处理建议：'+item.remediation]) : '' ])
 			]);
+		};
+		(result.environment || []).forEach(function(item) {
+			var endpoint = /^(?:(?:A|AAAA|SRV)\s+\S+|DNS 验收)\s+@(\S+)$/.exec(item.name || '');
+			var key = endpoint ? endpoint[1] : /^覆盖\s+/.test(item.name || '') ? 'coverage' : null;
+			if (key === null) { entries.push(item); return; }
+			if (!groups[key]) {
+				groups[key] = { key: key, items: [] };
+				entries.push(groups[key]);
+			}
+			groups[key].items.push(item);
+		});
+		var rows = entries.map(function(entry) {
+			if (!entry.items) return renderRow(entry);
+			var counts = {}, hasIssues = false;
+			entry.items.forEach(function(item) {
+				counts[item.level] = (counts[item.level] || 0) + 1;
+				if (['ok', 'info', 'skipped'].indexOf(item.level) === -1) hasIssues = true;
+			});
+			var label = entry.key === 'coverage' ? '域名接管范围' : entry.key === '127.0.0.1:53' ? '主 DNS' :
+				entry.key === '127.0.0.1:' + ((self.latestStatus || {}).resolver_port || uci.get('xbox-accel', 'main', 'resolver_port') || '5335') ? '独立解析实例' : 'DNS 转发入口';
+			if (entry.key !== 'coverage') label += '（' + entry.key + '）';
+			var summary = '域名转发验证 · ' + label + '：' + entry.items.length + ' 项';
+			['ok', 'fail', 'warn', 'unknown', 'skipped', 'info'].forEach(function(level) {
+				if (counts[level]) summary += '；' + LEVELS[level][0] + ' ' + counts[level];
+			});
+			var previous = self.environmentGroups[entry.key];
+			var state = { open: previous ? previous.open || (hasIssues && !previous.hasIssues) : hasIssues, hasIssues: hasIssues };
+			self.environmentGroups[entry.key] = state;
+			var details = E('details', {
+				'class': 'xbox-accel-dns-details',
+				'toggle': function(event) { state.open = event.target.open; }
+			}, [
+				E('summary', { 'style': 'cursor:pointer; padding:.5em 0; font-weight:bold' }, [summary]),
+				E('table', { 'class': 'table' }, entry.items.map(renderRow))
+			]);
+			details.open = state.open;
+			return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td left', 'colspan': 3 }, [details]) ]);
 		});
 
 		if (!rows.length)

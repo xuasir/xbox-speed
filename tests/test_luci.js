@@ -35,7 +35,7 @@ class MapMock {
 	section() {
 		return {
 			tab(name, label) { tabs.push({name, label}); },
-			taboption(tab, type, name) { const o = { tab, type, name, choices: [], depends() {}, value(key,label) { this.choices.push([key,label]); } }; options.push(o); return o; }
+		taboption(tab, type, name, title, description) { const o = { tab, type, name, title, description, choices: [], depends() {}, value(key,label) { this.choices.push([key,label]); } }; options.push(o); return o; }
 		};
 	}
 	render() { return Promise.resolve(E('form', {}, options.filter(o => o.render).map(o => o.render()))); }
@@ -72,7 +72,8 @@ const document = {
 };
 const L = { resolveDefault: p => Promise.resolve(p), bind: (fn, ctx) => fn.bind(ctx) };
 const form = { Map: MapMock, NamedSection: 1, Flag: 2, Value: 3, ListValue: 4, DynamicList: 5 };
-const poll = { add() {} };
+let pollStatus;
+const poll = { add(fn, interval) { pollStatus = fn; assert.strictEqual(interval, 5); } };
 const uci = { load() { return Promise.resolve(); }, get(config,section,key) { return {cron:'0 1 * * 1', health_interval:'40'}[key]; } };
 const window = { confirm: () => true };
 
@@ -84,7 +85,7 @@ const v = new Function('view', 'form', 'uci', 'rpc', 'poll', 'ui', 'dom', 'E', '
 	const data = await v.load();
 	const page = await v.render(data);
 	assert.strictEqual(page.children.length, 2, '顶部状态之外只能有一个统一标签表单');
-	assert.deepStrictEqual(tabs.map(t => t.name), ['basic', 'test', 'advanced', 'environment', 'logs']);
+	assert.deepStrictEqual(tabs.map(t => t.name), ['basic', 'platforms', 'test', 'advanced', 'environment', 'logs']);
 	assert(options.find(o => o.name === '_environment').tab === 'environment');
 	assert(options.find(o => o.name === '_logs').tab === 'logs');
 	assert.strictEqual(v.buttons.cancel.disabled, true, '空闲时停止按钮应禁用');
@@ -99,6 +100,53 @@ const v = new Function('view', 'form', 'uci', 'rpc', 'poll', 'ui', 'dom', 'E', '
 	// 环境检测的内容作为文本节点传入
 	assert.strictEqual(v.envNode.children[0].children[2].children[0], '<b>x</b>');
 	assert.strictEqual(v.envNode.children[0].children[1].children[0], '失败');
+
+	// 按入口折叠成功域名，异常组展开，刷新时保留手动选择。
+	const dnsReport = { environment: [
+		{ name: '依赖', level: 'ok', detail: '就绪' },
+		{ name: 'A assets1.xboxlive.cn @127.0.0.1:5335', level: 'ok', expected: '9.9.9.9', observed: '9.9.9.9' },
+		{ name: 'AAAA assets1.xboxlive.cn @127.0.0.1:5335', level: 'ok', expected: 'NODATA', observed: 'NODATA' },
+		{ name: 'SRV assets-srvs.xboxlive.com @127.0.0.1:53', level: 'fail', detail: '<b>异常</b>' },
+		{ name: 'DNS 验收 @127.0.0.1:1053', level: 'unknown', detail: '超时' },
+		{ name: '覆盖 dlassets.xboxlive.com', level: 'skipped', detail: '默认解析' }
+	] };
+	v.updateEnvironment(dnsReport);
+	const dnsGroups = () => v.envNode.children.slice(1).map(row => row.children[0].children[0]);
+	let groups = dnsGroups();
+	assert.strictEqual(groups.length, 4);
+	assert.strictEqual(groups[0].open, false);
+	assert(groups[0].children[0].children[0].includes('独立解析实例（127.0.0.1:5335）：2 项；正常 2'));
+	assert.strictEqual(groups[1].open, true);
+	assert.strictEqual(groups[2].open, true);
+	assert.strictEqual(groups[3].open, false);
+	assert.strictEqual(groups[1].children[1].children[0].children[2].children[0], '<b>异常</b>');
+	groups[0].attrs.toggle({target:{open:true}});
+	groups[1].attrs.toggle({target:{open:false}});
+	v.updateEnvironment(dnsReport);
+	groups = dnsGroups();
+	assert.strictEqual(groups[0].open, true, '已手动展开的成功组应保留');
+	assert.strictEqual(groups[1].open, false, '已手动折叠的异常组应保留');
+	groups[0].attrs.toggle({target:{open:false}});
+	v.updateEnvironment({environment:dnsReport.environment.map((row,i) => i === 1 ? {...row,level:'fail'} : row)});
+	assert.strictEqual(dnsGroups()[0].open, true, '新出现异常的入口应自动展开');
+	v.updateEnvironment(environment);
+
+	// 稳定状态降低 RPC 频率，异常和后台任务恢复快速刷新。
+	calls.length = 0;
+	v.updateStatus(status);
+	assert(v.nextStatusPoll > Date.now() + 29000);
+	await pollStatus();
+	assert(!calls.some(c => c[0] === 'status'));
+	v.nextStatusPoll = 0;
+	await pollStatus();
+	assert.strictEqual(calls.filter(c => c[0] === 'status').length, 1);
+	v.updateStatus({...status,testing:true});
+	assert(v.nextStatusPoll < Date.now() + 6000);
+	v.updateStatus({...status,running:false});
+	assert(v.nextStatusPoll < Date.now() + 6000);
+	v.updateStatus({status_error:'RPC unavailable'});
+	assert(v.nextStatusPoll < Date.now() + 6000);
+	v.updateStatus(status);
 
 	// 未知与部分成功不能被显示成关闭或全部通过。
 	v.updateStatus({...status,last_test:{id:'t1',kind:'test',status:'partial',code:'PARTIAL_RESULT',stage:'finished',message:'国内失败',groups:{cn:{status:'failed',code:'FULL_TEST_FAILED',message:'复测失败'},com:{status:'success',code:'SELECTED',message:'采样通过'}},application:{status:'failed',code:'DNS_MISMATCH'}}});
@@ -134,8 +182,29 @@ const v = new Function('view', 'form', 'uci', 'rpc', 'poll', 'ui', 'dom', 'E', '
 	const names = options.map(o => o.name);
 	for (const n of [ 'enabled', 'autostart', 'optimize_cn', 'optimize_com', 'redirect_cn', 'isp', 'schedule_type', 'schedule_time', 'schedule_weekday', 'schedule_monthday', 'health_interval',
 		'switch_threshold', 'max_candidates', 'quick_size_mb', 'quick_time', 'top_n', 'full_size_mb', 'full_time',
-		'override_cdn_hosts', 'passwall_direct', 'passwall_restart', 'dnsmasq_instance', 'resolver_port', 'ttl', 'fallback_dns' ])
+		'override_cdn_hosts', 'passwall_direct', 'passwall_restart', 'dnsmasq_instance', 'resolver_port', 'ttl', 'fallback_dns', 'log_mode' ])
 		assert(names.includes(n), 'missing option ' + n);
+	for (const group of ['store','ps','xbox_old','switch']) {
+		assert.strictEqual(options.find(o=>o.name==='optimize_'+group).default, '0');
+		assert(names.includes('test_url_'+group) && names.includes('extra_ips_'+group));
+		assert(v.buttons['test_'+group]);
+	}
+	assert(names.includes('store_test_app') && names.includes('verification_urls_switch') && names.includes('verification_urls_ps'));
+	const switchLink = options.find(o=>o.name==='verification_urls_switch');
+	assert(switchLink.optional && switchLink.title.includes('可选') && switchLink.description.includes('默认节点映射'));
+	assert.strictEqual(switchLink.validate('main',''), true);
+	assert.strictEqual(switchLink.validate('main','https://atum.hac.lp1.d4c.nintendo.net/game?token=value'), true);
+	for (const url of ['https://evil.example/game','https://ctest-dl-lp1.cdn.nintendo.net/30m','https://atum.hac.lp1.d4c.nintendo.net:8443/game','https://user@atum.hac.lp1.d4c.nintendo.net/game'])
+		assert.notStrictEqual(switchLink.validate('main',url), true);
+	v.updateStatus({...status,platforms:{switch:{enabled:true,ip:'9.9.9.9',game_status:'default',game_configured:0,game_verified:0,game_mapped:3,game_default_mapped:3,game_total:3}},last_test:{kind:'test',status:'partial',groups:{store:{status:'failed',code:'STORE_LINK_FETCH_FAILED',message:'链接获取失败'},switch:{status:'success',code:'SELECTED',message:'公开测速通过'}}}});
+	const switchText = () => v.statusNode.children.find(row=>row.children[0].children[0]==='Switch').children[1].children[0];
+	assert(switchText().includes('已准备 3/3（默认映射 3）') && switchText().includes('增强校验：可选'));
+	assert(v.taskDetails.children[1].children[0].includes('STORE_LINK_FETCH_FAILED'));
+	v.updateStatus({...status,platforms:{switch:{enabled:true,ip:'9.9.9.9',game_status:'pending',game_configured:1,game_verified:0,game_mapped:2,game_default_mapped:2,game_total:3}}});
+	assert(switchText().includes('已准备 2/3（默认映射 2）') && switchText().includes('增强校验：0/1'));
+	v.updateStatus({...status,platforms:{switch:{enabled:true,ip:'9.9.9.9',game_status:'verified',game_configured:1,game_verified:1,game_mapped:3,game_default_mapped:2,game_total:3}}});
+	assert(switchText().includes('已准备 3/3（默认映射 2）') && switchText().includes('增强校验：1/1'));
+	v.updateStatus(status);
 
 	// 日/周/月 + 时间，不枚举时间预设；旧简单周计划自动映射。
 	assert(!options.some(o => o.name === 'cron'));
@@ -154,10 +223,15 @@ const v = new Function('view', 'form', 'uci', 'rpc', 'poll', 'ui', 'dom', 'E', '
 	const health = options.find(o=>o.name==='health_interval');
 	assert.strictEqual(health.type, form.ListValue);
 	assert(health.choices.some(c=>c[0]==='40' && c[1].includes('00、40')));
+	const logMode = options.find(o => o.name === 'log_mode');
+	assert.strictEqual(logMode.tab, 'logs');
+	assert.strictEqual(logMode.default, 'concise');
+	assert.deepStrictEqual(logMode.choices.map(c => c[0]), ['concise', 'detail']);
 
 	// 测速期间禁用测速按钮，只允许停止
 	v.updateStatus(Object.assign({}, status, { testing: true }));
 	assert(v.buttons.test.disabled && v.buttons.test_cn.disabled && v.buttons.test_com.disabled && v.buttons.restart.disabled);
+	for (const group of ['store','ps','xbox_old','switch']) assert(v.buttons['test_'+group].disabled);
 	assert(!v.buttons.cancel.disabled);
 	calls.length = 0;
 	v.updateStatus(status);

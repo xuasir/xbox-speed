@@ -20,11 +20,61 @@ T_CN_STATUS=skipped; T_CN_CODE=NOT_REQUESTED; T_CN_MESSAGE='未请求此组'
 T_COM_STATUS=skipped; T_COM_CODE=NOT_REQUESTED; T_COM_MESSAGE='未请求此组'
 T_CN_IP=; T_CN_SPEED=0; T_CN_CANDIDATES=0; T_CN_VALID=0
 T_COM_IP=; T_COM_SPEED=0; T_COM_CANDIDATES=0; T_COM_VALID=0
+T_STORE_STATUS=skipped; T_STORE_CODE=NOT_REQUESTED; T_STORE_MESSAGE='未请求此组'
+T_PS_STATUS=skipped; T_PS_CODE=NOT_REQUESTED; T_PS_MESSAGE='未请求此组'
+T_XBOX_OLD_STATUS=skipped; T_XBOX_OLD_CODE=NOT_REQUESTED; T_XBOX_OLD_MESSAGE='未请求此组'
+T_SWITCH_STATUS=skipped; T_SWITCH_CODE=NOT_REQUESTED; T_SWITCH_MESSAGE='未请求此组'
+T_STORE_IP=; T_STORE_SPEED=0; T_STORE_CANDIDATES=0; T_STORE_VALID=0
+T_PS_IP=; T_PS_SPEED=0; T_PS_CANDIDATES=0; T_PS_VALID=0
+T_XBOX_OLD_IP=; T_XBOX_OLD_SPEED=0; T_XBOX_OLD_CANDIDATES=0; T_XBOX_OLD_VALID=0
+T_SWITCH_IP=; T_SWITCH_SPEED=0; T_SWITCH_CANDIDATES=0; T_SWITCH_VALID=0
+TASK_GROUPS='cn com store ps xbox_old switch'
+TASK_HAD_WARNING=0
+LOG_INFO_CODES='TASK_STARTED TASK_FINAL STAGE_SUMMARY NODE_SELECTED ROUTER_VERIFIED DISABLE_VERIFIED'
+
+log_event_enabled() {
+    [ "${LOG_MODE:-concise}" = detail ] && return 0
+    case "$1" in
+    WARN|ERROR) return 0 ;;
+    INFO)
+        [ "${TASK_KIND:-}" = health ] && [ "$2" = TASK_STARTED ] && return 1
+        case " $LOG_INFO_CODES " in *" $2 "*) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+# 正常健康检查的摘要留在内存；告警、修复和其他任务仍保存到闪存。
+task_persistence_needed() {
+    [ "${LOG_MODE:-concise}" = concise ] && [ "$TASK_KIND" = health ] &&
+        [ "$TASK_HAD_WARNING" = 0 ] && [ "$TASK_PERSIST_WARNING" = 0 ] || return 0
+    case "$TASK_STATUS" in
+    queued|running) return 1 ;;
+    success|skipped)
+        [ "$TASK_APPLY_CODE" = NO_CHANGE ] || return 0
+        case "$TASK_CODE" in HEALTH_COMPLETED|NOT_DUE) return 1 ;; esac ;;
+    esac
+    return 0
+}
 
 # Write flash only at task completion, with a fixed size and one atomic snapshot.
 diagnostic_log() {
     if [ -s "$LOG_FILE" ]; then cat "$LOG_FILE";
     elif [ -s "$STATE_DIR/activity-last.log" ]; then cat "$STATE_DIR/activity-last.log"; fi
+}
+
+display_log() {
+    if [ "${LOG_MODE:-concise}" = detail ]; then
+        diagnostic_log | tail -n 300
+    else
+        diagnostic_log | awk -v codes="$LOG_INFO_CODES" '
+            BEGIN {gsub(/ /,"|",codes); summary="\\[INFO\\]\\[(" codes ")\\]"}
+            /^[0-9][0-9]-[0-9][0-9] [0-9:]+ \[ (正常|信息|未执行) \]/ {skip_expected=1; next}
+            skip_expected && /^[0-9][0-9]-[0-9][0-9] [0-9:]+ +预期=/ {next}
+            {skip_expected=0}
+            /\[(WARN|ERROR)\]\[/ {print; next}
+            /\[(DEBUG|INFO)\]\[/ {if ($0 ~ summary) print; next}
+            {print}' | tail -n 300
+    fi
 }
 
 persist_log() {
@@ -46,6 +96,8 @@ safe_text() {
 
 task_event() {
     local level=$1 code=$2 message line
+    case "$level" in WARN|ERROR) TASK_HAD_WARNING=1 ;; esac
+    log_event_enabled "$level" "$code" || return 0
     message=$(safe_text "$3")
     line="$(stamp) [${TASK_ID:--}][$TASK_STAGE][$level][$code] $message"
     printf '%s\n' "$line" >&2
@@ -53,7 +105,7 @@ task_event() {
         mkdir -p "$TMP_DIR"
         printf '%s\n' "$line" >>"$LOG_FILE"
     fi
-    case "$level" in WARN|ERROR) logger -t "$NAME" -- "$line" 2>/dev/null ;; esac
+    case "$level" in WARN|ERROR) system_log "$line" ;; esac
     return 0
 }
 
@@ -194,13 +246,18 @@ json_append_document() {
     json_close_object
 }
 
+task_group_prefix() {
+    case "$1" in
+    cn) echo T_CN ;; com) echo T_COM ;; store) echo T_STORE ;; ps) echo T_PS ;;
+    xbox_old) echo T_XBOX_OLD ;; switch) echo T_SWITCH ;; *) return 1 ;;
+    esac
+}
+
 add_task_group() {
-    local group=$1
-    if [ "$group" = cn ]; then
-        set -- "$T_CN_STATUS" "$T_CN_CODE" "$T_CN_MESSAGE" "$T_CN_IP" "$T_CN_SPEED" "$T_CN_CANDIDATES" "$T_CN_VALID"
-    else
-        set -- "$T_COM_STATUS" "$T_COM_CODE" "$T_COM_MESSAGE" "$T_COM_IP" "$T_COM_SPEED" "$T_COM_CANDIDATES" "$T_COM_VALID"
-    fi
+    local group=$1 prefix
+    prefix=$(task_group_prefix "$group") || return 1
+    # eval 的代码只包含白名单前缀与变量引用；消息内容作为变量值展开。
+    eval "set -- \"\${${prefix}_STATUS}\" \"\${${prefix}_CODE}\" \"\${${prefix}_MESSAGE}\" \"\${${prefix}_IP}\" \"\${${prefix}_SPEED}\" \"\${${prefix}_CANDIDATES}\" \"\${${prefix}_VALID}\""
     json_add_object "$group"
     json_add_string status "$1"; json_add_string code "$2"; json_add_string message "$(safe_text "$3")"
     json_add_string ip "$4"; json_add_int speed_bps "${5:-0}"
@@ -211,8 +268,10 @@ add_task_group() {
 task_snapshot() {
     [ -n "$TASK_ID" ] || return 0
     local persist=${1:-0} destination="$TMP_DIR/live-task.json" temporary
-    mkdir -p "$TMP_DIR" "$STATE_DIR"
-    chmod 700 "$TMP_DIR" "$STATE_DIR"
+    if [ "$persist" = 1 ] && ! task_persistence_needed; then persist=0; fi
+    mkdir -p "$TMP_DIR"
+    chmod 700 "$TMP_DIR"
+    if [ "$persist" = 1 ]; then mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; fi
     temporary="$destination.new.$$"
     (
         . /usr/share/libubox/jshn.sh
@@ -228,13 +287,19 @@ task_snapshot() {
         json_add_string finished_text "$( [ "$TASK_FINISHED" -gt 0 ] && date -d "@$TASK_FINISHED" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 未结束 )"
         json_add_int duration_s "$((TASK_FINISHED > 0 && TASK_STARTED > 0 ? TASK_FINISHED - TASK_STARTED : 0))"
         json_add_boolean persistence_warning "$TASK_PERSIST_WARNING"
-        json_add_object groups; add_task_group cn; add_task_group com; json_close_object
+        json_add_object groups
+        for group in $TASK_GROUPS; do add_task_group "$group"; done
+        json_close_object
         json_add_object application
         json_add_string status "$TASK_APPLY_STATUS"; json_add_string code "$TASK_APPLY_CODE"
         json_add_string message "$(safe_text "$TASK_APPLY_MESSAGE")"; json_close_object
         json_add_object xbox
         json_add_string status unknown
         json_add_string message '只验证路由器软件与解析链路，Xbox 是否使用该节点及实际提速仍需实机确认'
+        json_close_object
+        json_add_object clients
+        json_add_string status unknown
+        json_add_string message '平台测速与路由器验收见分组明细；设备实际下载节点和稳定速度待实机验证'
         json_close_object
         json_dump
     ) >"$temporary" && mv "$temporary" "$destination" || { TASK_MEMORY_READY=0; return 1; }
@@ -274,6 +339,7 @@ task_begin() {
     [ -n "$TASK_ID" ] || TASK_ID="$(date '+%Y%m%dT%H%M%S')-$$"
     TASK_STARTED=$(date +%s); TASK_QUEUED=${TASK_QUEUED:-$TASK_STARTED}; TASK_STATUS=running; TASK_STAGE=start; TASK_CODE=RUNNING
     TASK_MESSAGE='任务正在运行'; TASK_FINISHED=0; TASK_EXIT=0
+    TASK_HAD_WARNING=0
     task_snapshot 1
     task_event INFO TASK_STARTED "kind=$TASK_KIND trigger=$TASK_TRIGGER"
 }
@@ -284,28 +350,31 @@ task_stage() {
 }
 
 group_report() {
-    local group=$1 status=$2 code=$3 message=$4 ip=${5:-} speed=${6:-0} count=${7:-0} valid=${8:-0}
-    case "$group" in
-    cn) T_CN_STATUS=$status; T_CN_CODE=$code; T_CN_MESSAGE=$message; T_CN_IP=$ip; T_CN_SPEED=$speed; T_CN_CANDIDATES=$count; T_CN_VALID=$valid ;;
-    com) T_COM_STATUS=$status; T_COM_CODE=$code; T_COM_MESSAGE=$message; T_COM_IP=$ip; T_COM_SPEED=$speed; T_COM_CANDIDATES=$count; T_COM_VALID=$valid ;;
-    esac
+    local group=$1 status=$2 code=$3 message=$4 ip=${5:-} speed=${6:-0} count=${7:-0} valid=${8:-0} prefix
+    prefix=$(task_group_prefix "$group") || return 1
+    eval "${prefix}_STATUS=\$status; ${prefix}_CODE=\$code; ${prefix}_MESSAGE=\$message; ${prefix}_IP=\$ip; ${prefix}_SPEED=\$speed; ${prefix}_CANDIDATES=\$count; ${prefix}_VALID=\$valid"
     task_snapshot 0
 }
 
 task_on_exit() {
-    local rc=$1 severity=INFO
+    local rc=$1 severity=INFO group prefix status
     [ -n "$TASK_ID" ] || return 0
     TASK_EXIT=$rc; TASK_FINISHED=$(date +%s)
     if [ "$TASK_STATUS" = running ] || [ "$TASK_STATUS" = queued ]; then
         TASK_STATUS=failed; TASK_CODE=UNEXPECTED_EXIT
         TASK_MESSAGE="任务在 $TASK_STAGE 阶段退出（exit=$rc），没有完整结束摘要"
     fi
-    if [ "$T_CN_STATUS" = running ]; then T_CN_STATUS=$TASK_STATUS; T_CN_CODE=$TASK_CODE; T_CN_MESSAGE=$TASK_MESSAGE; fi
-    if [ "$T_COM_STATUS" = running ]; then T_COM_STATUS=$TASK_STATUS; T_COM_CODE=$TASK_CODE; T_COM_MESSAGE=$TASK_MESSAGE; fi
+    for group in $TASK_GROUPS; do
+        prefix=$(task_group_prefix "$group") || continue
+        eval "status=\${${prefix}_STATUS}"
+        if [ "$status" = running ]; then
+            eval "${prefix}_STATUS=\$TASK_STATUS; ${prefix}_CODE=\$TASK_CODE; ${prefix}_MESSAGE=\$TASK_MESSAGE"
+        fi
+    done
     case "$TASK_STATUS" in failed) severity=ERROR ;; partial|cancelled|interrupted) severity=WARN ;; esac
     task_event "$severity" TASK_FINAL "status=$TASK_STATUS code=$TASK_CODE exit=$rc $TASK_MESSAGE"
     rotate_log
-    if ! persist_log; then
+    if task_persistence_needed && ! persist_log; then
         TASK_PERSIST_WARNING=1
         task_event WARN LOG_PERSIST_FAILED '日志快照保存失败；当前日志可在运行日志页查看，建议立即导出'
     fi
@@ -315,7 +384,7 @@ task_on_exit() {
 # A queued worker may be cancelled before installing its EXIT trap. Preserve its
 # existing record and finish it from the requester only after the worker stops.
 finish_cancelled_record() {
-    local document old="${JSON_PREFIX:-}" status group
+    local document old="${JSON_PREFIX:-}" status group prefix
     . /usr/share/libubox/jshn.sh
     document=$(last_task_document)
     json_set_namespace XA_CANCEL_
@@ -326,14 +395,12 @@ finish_cancelled_record() {
     json_get_var TASK_STAGE stage; json_get_var TASK_STARTED started_at; json_get_var TASK_QUEUED queued_at
     TASK_STARTED=$(to_int "$TASK_STARTED"); TASK_QUEUED=$(to_int "$TASK_QUEUED")
     if json_select groups; then
-        for group in cn com; do
+        for group in $TASK_GROUPS; do
             if json_select "$group"; then
-                case "$group" in
-                cn) json_get_var T_CN_STATUS status; json_get_var T_CN_CODE code; json_get_var T_CN_MESSAGE message
-                    json_get_var T_CN_IP ip; json_get_var T_CN_SPEED speed_bps; json_get_var T_CN_CANDIDATES candidates; json_get_var T_CN_VALID valid_samples ;;
-                com) json_get_var T_COM_STATUS status; json_get_var T_COM_CODE code; json_get_var T_COM_MESSAGE message
-                     json_get_var T_COM_IP ip; json_get_var T_COM_SPEED speed_bps; json_get_var T_COM_CANDIDATES candidates; json_get_var T_COM_VALID valid_samples ;;
-                esac
+                prefix=$(task_group_prefix "$group") || continue
+                json_get_var "${prefix}_STATUS" status; json_get_var "${prefix}_CODE" code; json_get_var "${prefix}_MESSAGE" message
+                json_get_var "${prefix}_IP" ip; json_get_var "${prefix}_SPEED" speed_bps
+                json_get_var "${prefix}_CANDIDATES" candidates; json_get_var "${prefix}_VALID" valid_samples
                 json_select ..
             fi
         done

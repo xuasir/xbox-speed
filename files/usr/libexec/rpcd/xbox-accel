@@ -8,7 +8,7 @@ reply() {
 	json_init
 	json_add_boolean ok "$1"
 	json_add_string message "$2"
-	case "${command:-}" in test|test_cn|test_com|apply|restart|verify|export)
+	case "${command:-}" in test|test_cn|test_com|test_store|test_ps|test_xbox_old|test_switch|apply|restart|verify|export)
 		json_add_boolean accepted "$1"
 		json_add_string task_id "$(printf '%s' "$2" | sed -n 's/.*任务已受理：\([0-9T-]*\).*/\1/p')"
 		;;
@@ -32,6 +32,10 @@ call)
 		test) out=$("$PROG" start_test all manual_ui 2>&1) && ok=1 || ok=0 ;;
 		test_cn) out=$("$PROG" start_test cn manual_ui 2>&1) && ok=1 || ok=0 ;;
 		test_com) out=$("$PROG" start_test com manual_ui 2>&1) && ok=1 || ok=0 ;;
+		test_store) out=$("$PROG" start_test store manual_ui 2>&1) && ok=1 || ok=0 ;;
+		test_ps) out=$("$PROG" start_test ps manual_ui 2>&1) && ok=1 || ok=0 ;;
+		test_xbox_old) out=$("$PROG" start_test xbox_old manual_ui 2>&1) && ok=1 || ok=0 ;;
+		test_switch) out=$("$PROG" start_test switch manual_ui 2>&1) && ok=1 || ok=0 ;;
 		cancel) out=$("$PROG" cancel 2>&1) && ok=1 || ok=0 ;;
 		clear_log) out=$("$PROG" clear_log 2>&1) && ok=1 || ok=0 ;;
 		reset) out=$("$PROG" reset 2>&1) && ok=1 || ok=0 ;;

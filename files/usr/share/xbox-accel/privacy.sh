@@ -74,13 +74,14 @@ build_redacted_report() {
         json_append_document current_checks "$checks"
         json_append_document last_application "$(application_report_document)"
         json_add_object configuration
-        for key in enabled autostart optimize_cn optimize_com redirect_cn isp resolver_port dnsmasq_instance ttl cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval quick_size_mb quick_time full_size_mb full_time max_candidates top_n switch_threshold passwall_direct passwall_restart override_cdn_hosts; do
+        for key in enabled autostart optimize_cn optimize_com redirect_cn isp resolver_port dnsmasq_instance ttl cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval log_mode quick_size_mb quick_time full_size_mb full_time max_candidates top_n switch_threshold passwall_direct passwall_restart override_cdn_hosts; do
             json_add_string "$key" "$(cfg "$key" '')"
         done
+        for key in $(platform_config_keys); do json_add_string "$key" "$(cfg "$key" '')"; done
         json_close_object
         json_add_string recent_plugin_log "$(diagnostic_log | tail -n 300)"
         json_add_string previous_task_log "$(tail -n 300 "$STATE_DIR/activity-last.log" 2>/dev/null)"
-        json_add_string limitation '没有抓包，也没有 Xbox 实际速度数据；软件检查成功不能证明 Xbox 已加速。'
+        json_add_string limitation '平台测速与路由器验收结果见分组明细；客户端实际节点及下载速度待设备验证。'
         json_dump
     ) >"$raw" || return 1
     redact_report <"$raw" >"$temporary" || return 1

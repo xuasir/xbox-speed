@@ -53,7 +53,7 @@ class DiagnosticTests(unittest.TestCase):
     def setUpClass(cls):
         run('xbox-accel disable >/dev/null; cp /etc/config/xbox-accel /tmp/xa-diag-config-backup; mkdir -p /tmp/xa-diag-mock')
         write('/tmp/xa-diag-mock/curl',CURL);write('/tmp/xa-diag-mock/nslookup',NS)
-        run("uci set xbox-accel.main.enabled=0; uci set xbox-accel.main.redirect_cn=0; uci set xbox-accel.main.isp=auto; uci set xbox-accel.main.passwall_direct=0; uci set xbox-accel.main.use_seeds=0; uci set xbox-accel.main.use_isp_dns=0; uci set xbox-accel.main.max_candidates=2; uci set xbox-accel.main.quick_size_mb=1; uci set xbox-accel.main.full_size_mb=1; uci set xbox-accel.main.cron='15 5 * * *'; uci commit xbox-accel; xbox-accel reset >/dev/null")
+        run("uci set xbox-accel.main.enabled=0; uci set xbox-accel.main.redirect_cn=0; uci set xbox-accel.main.isp=auto; uci set xbox-accel.main.passwall_direct=0; uci set xbox-accel.main.use_seeds=0; uci set xbox-accel.main.use_isp_dns=0; uci set xbox-accel.main.max_candidates=2; uci set xbox-accel.main.quick_size_mb=1; uci set xbox-accel.main.full_size_mb=1; uci set xbox-accel.main.cron='15 5 * * *'; uci set xbox-accel.main.log_mode=concise; uci commit xbox-accel; xbox-accel reset >/dev/null; rm -f /etc/xbox-accel/candidates_cn /etc/xbox-accel/candidates_com")
 
     @classmethod
     def tearDownClass(cls):
@@ -213,7 +213,8 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(task['exit_code'],130)
 
     def test_11_persistence_failure_keeps_current_result_and_warning(self):
-        write('/tmp/xa-diag-mock/cp','#!/bin/sh\ncase "$2" in /etc/xbox-accel/*) exit 1 ;; esac\nexec /bin/cp "$@"\n')
+        # 摘要持久化故障与节点事务回滚使用独立的注入范围。
+        write('/tmp/xa-diag-mock/cp','#!/bin/sh\ncase "$2" in /etc/xbox-accel/last-task.json.new.*|/etc/xbox-accel/last-speed-task.json.new.*) exit 1 ;; esac\nexec /bin/cp "$@"\n')
         write('/tmp/xa-diag-mock/mv','#!/bin/sh\ncase "$2" in /etc/xbox-accel/activity-last.log) exit 1 ;; esac\nexec /bin/mv "$@"\n')
         try:
             tested=run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel test cn')
@@ -246,6 +247,93 @@ exec /usr/sbin/nft "$@"
             self.assertTrue(any(r['code']=='DIRECT_SET_MISSING' and r['level']=='fail' for r in report['environment']))
         finally:
             run('test ! -f /tmp/xa-diag-best-cn || mv /tmp/xa-diag-best-cn /etc/xbox-accel/best_cn; test ! -f /tmp/xa-diag-best-com || mv /tmp/xa-diag-best-com /etc/xbox-accel/best_com; rm -f /tmp/xa-diag-mock/nft; uci set xbox-accel.main.enabled=0; uci set xbox-accel.main.passwall_direct=0; uci commit xbox-accel')
+
+    def test_13_log_modes_preserve_ranking_and_aggregate_failures(self):
+        records = []
+        had_candidates = run('test -f /etc/xbox-accel/candidates_cn', check=False).returncode == 0
+        if had_candidates:
+            run('cp /etc/xbox-accel/candidates_cn /tmp/xa-diag-log-candidates-backup')
+        try:
+            for mode in ['concise', 'detail']:
+                run(f'uci set xbox-accel.main.log_mode={mode}; uci commit xbox-accel')
+                tested = run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel test')
+                groups = self.status()['last_test']['groups']
+                records.append({group: (result['ip'], result['speed_bps']) for group, result in groups.items()})
+                self.assertIn('[INFO][STAGE_SUMMARY]', tested.stderr)
+                self.assertEqual('[INFO][OK]' in tested.stderr, mode == 'detail')
+                self.assertEqual('[DEBUG][OK]' in tested.stderr, mode == 'detail')
+            self.assertEqual(records[0], records[1])
+            run('echo 9.9.9.10 >> /etc/xbox-accel/candidates_cn; echo connect > /tmp/xa-diag-mock/mode')
+            for mode, count in [('concise', 1), ('detail', 2)]:
+                run(f'uci set xbox-accel.main.log_mode={mode}; uci commit xbox-accel')
+                failed = run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel test cn', check=False)
+                self.assertEqual(failed.returncode, 1)
+                self.assertEqual(failed.stderr.count('[WARN][CONNECT_FAILED]'), count)
+                self.assertIn('curl_exit=7', failed.stderr)
+                if mode == 'concise':
+                    self.assertIn('[WARN][STAGE_FAILURE_SUMMARY] CONNECT_FAILED=2', failed.stderr)
+            run('uci set xbox-accel.main.log_mode=concise; uci commit xbox-accel')
+            displayed = self.status()
+            self.assertEqual(displayed['log_mode'], 'concise')
+            self.assertNotIn('[INFO][OK]', displayed['log'])
+            self.assertIn('[INFO][OK]', run('cat /tmp/xbox-accel/activity.log').stdout)
+        finally:
+            if had_candidates:
+                run('cp /tmp/xa-diag-log-candidates-backup /etc/xbox-accel/candidates_cn')
+            else:
+                run('rm -f /etc/xbox-accel/candidates_cn')
+            run('rm -f /tmp/xa-diag-mock/mode; uci set xbox-accel.main.log_mode=concise; uci commit xbox-accel')
+
+    def test_14_stable_health_keeps_flash_and_persists_warnings(self):
+        run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel test; uci set xbox-accel.main.enabled=1; uci commit xbox-accel; /etc/init.d/xbox-accel reload')
+        snapshot_files = '/etc/xbox-accel/last-task.json /etc/xbox-accel/activity-last.log'
+        before = run(f'sha256sum {snapshot_files}').stdout
+        health = run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel health')
+        task = self.status()['last_task']
+        self.assertEqual(task['kind'], 'health')
+        self.assertEqual(task['status'], 'success')
+        self.assertEqual(task['application']['code'], 'NO_CHANGE')
+        self.assertNotIn('TASK_STARTED', health.stderr)
+        self.assertIn('TASK_FINAL', health.stderr)
+        self.assertEqual(run(f'sha256sum {snapshot_files}').stdout, before)
+
+        # 短暂失败后恢复仍保留告警和持久摘要。
+        write('/tmp/xa-diag-mock/curl', '''#!/bin/sh
+if [ ! -e /tmp/xa-diag-mock/health-warning-seen ]; then
+    touch /tmp/xa-diag-mock/health-warning-seen
+    printf '000 0 0 0 0 -'; exit 7
+fi
+printf '206 1048576 20000000 0.1 0.2 9.9.9.9'
+''')
+        try:
+            recovered = run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel health')
+            self.assertIn('CONNECT_FAILED', recovered.stderr)
+            task = self.status()['last_task']
+            self.assertEqual(task['status'], 'success')
+            saved = json.loads(run('cat /etc/xbox-accel/last-task.json').stdout)
+            self.assertEqual(saved['id'], task['id'])
+            self.assertNotEqual(run(f'sha256sum {snapshot_files}').stdout, before)
+            run('uci set xbox-accel.main.log_mode=detail; uci commit xbox-accel')
+            detailed = run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel health')
+            self.assertIn('[DEBUG][OK]', detailed.stderr)
+            self.assertEqual(json.loads(run('cat /etc/xbox-accel/last-task.json').stdout)['id'], self.status()['last_task']['id'])
+        finally:
+            write('/tmp/xa-diag-mock/curl', CURL)
+            run('rm -f /tmp/xa-diag-mock/health-warning-seen; uci set xbox-accel.main.log_mode=concise; uci commit xbox-accel')
+
+    def test_15_cli_report_uses_terminal_without_duplicate_logs(self):
+        try:
+            for mode in ['concise', 'detail']:
+                run(f'uci set xbox-accel.main.log_mode={mode}; uci commit xbox-accel; xbox-accel clear_log')
+                report = run('PATH=/tmp/xa-diag-mock:$PATH xbox-accel check')
+                self.assertIn('[ 正常 ] [DNS_MATCH]', report.stdout)
+                self.assertIn('预期=9.9.9.9；实际=9.9.9.9', report.stdout)
+                log = self.status()['log']
+                self.assertNotIn('[ 正常 ]', log)
+                self.assertIn('[TASK_FINAL]', log)
+                self.assertEqual('[INFO][DNS_MATCH]' in log, mode == 'detail')
+        finally:
+            run('uci set xbox-accel.main.log_mode=concise; uci commit xbox-accel')
 
 
 if __name__=='__main__':unittest.main()

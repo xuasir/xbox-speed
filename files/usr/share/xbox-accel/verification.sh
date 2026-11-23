@@ -124,7 +124,10 @@ configuration_signature() {
         for key in enabled autostart optimize_cn optimize_com redirect_cn resolver_port dnsmasq_instance ttl isp cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval passwall_direct passwall_restart override_cdn_hosts fallback_dns redirect_ip test_url_cn test_url_com test_offset_cn test_offset_com; do
             printf '%s=%s\n' "$key" "$(cfg "$key" '')"
         done
-        printf 'cn=%s:%s\ncom=%s:%s\n' "$(best_ip cn)" "$(best_domains cn)" "$(best_ip com)" "$(best_domains com)"
+        for key in $(platform_config_keys); do printf '%s=%s\n' "$key" "$(cfg "$key" '')"; done
+        for key in $ALL_GROUPS; do printf '%s=%s:%s\n' "$key" "$(best_ip "$key")" "$(best_domains "$key")"; done
+        printf 'switch_mappings=%s\n' "$(pinned_domains switch)"
+        cat "$STATE_DIR/resources_switch" 2>/dev/null
         main_rules_now
         uci -q get uhttpd.main.error_page
         grep -F "$CRON_TAG" "$CRON_FILE" 2>/dev/null
@@ -134,6 +137,28 @@ configuration_signature() {
         elif command -v md5sum >/dev/null 2>&1; then md5sum | awk '{print "md5:" $1}';
         else cat >/dev/null; echo unavailable; fi
     }
+}
+
+verify_resource_row() {
+    local g=$1 host=$2 url=$3 ip=$4 work=$5 directory got classification title
+    title="测试资源 $(group_label "$g") $host"
+    case "$g" in cn|com) title="测试资源 $g" ;;
+    switch) case " $SWITCH_GAME_DOMAINS " in *" $host "*) title="增强校验资源 $host" ;; *) title="公开测试资源 $host" ;; esac ;;
+    esac
+    if [ -z "$ip" ]; then
+        directory="$work/resource-$g-$host"
+        dns_capture a "$host" "$(cfg fallback_dns 223.5.5.5 | awk '{print $1}')" "$directory"
+        dns_parse a "$directory"; ip=$(printf '%s\n' "$DNS_VALUES" | ipv4s | public_only | head -n 1)
+    fi
+    if [ -z "$ip" ]; then check_row "$title" unknown RESOURCE_DNS_UNKNOWN '没有可用测试地址，资源可用性待确认' '检查上游 DNS 与节点发现结果' measurement; return; fi
+    got=$(probe_resource "$ip" "$url" "$(domain_offset "$g" "$host")" 1024 3 "$g")
+    set -- $got
+    classification=$(probe_classify "${4:-0}" "${1:-000}" "$(to_int "$2")" 1024)
+    case "$classification" in
+    OK|TIME_LIMIT_WITH_DATA) check_row "$title" ok RESOURCE_AVAILABLE "host=$host ip=$ip HTTP=$1 bytes=$2；该资源可取样，设备实际速度待实机测量" '' measurement ;;
+    HTTP_*|RANGE_INVALID|RANGE_IGNORED|INSUFFICIENT_DATA) check_row "$title" warn "$classification" "host=$host ip=$ip HTTP=$1 bytes=$2；该节点资源校验失败" "$(probe_advice "$classification")" measurement ;;
+    *) check_row "$title" unknown "$classification" "curl_exit=$4 HTTP=$1 bytes=$2 connect_s=${5:-0} total_s=${6:-0} error=$(head -c 250 "$TMP_DIR/probe-error-$$.txt" 2>/dev/null)" "$(probe_advice "$classification")" measurement ;;
+    esac
 }
 
 diagnostic_environment() {
@@ -181,20 +206,33 @@ diagnostic_environment() {
     if [ "$enabled" = 1 ] && [ "$mode" != off ] && ! cfg_bool override_cdn_hosts 1; then
         for host in $CDN_HOSTS; do check_row "覆盖 $host" skipped FEATURE_DISABLED '备用 CDN 接管已关闭，当前保持默认解析'; done
     fi
-    for g in cn com; do
+    for g in $ALL_GROUPS; do
         expected=""; hosts_group=""
         if [ "$g" = cn ]; then
             if ! cfg_bool optimize_cn 1; then check_row 国内优选 skipped FEATURE_DISABLED '国内优选未开启'; continue; fi
             hosts_group=$CN_DOMAINS; ip=$(best_ip cn)
-        elif [ "$mode" = off ]; then check_row 国际处理 skipped FEATURE_DISABLED '国际域名不处理'; continue
-        elif [ "$mode" = redirect ]; then
+        elif [ "$g" = com ] && [ "$mode" = off ]; then check_row 国际处理 skipped FEATURE_DISABLED '国际域名不处理'; continue
+        elif [ "$g" = com ] && [ "$mode" = redirect ]; then
             hosts_group="$COM_DOMAINS $COM_DL_DOMAINS"; cfg_bool override_cdn_hosts 1 && hosts_group="$hosts_group $CDN_HOSTS"; ip=$(lan_ip)
-        else
+        elif [ "$g" = com ]; then
             hosts_group=$COM_DOMAINS; cfg_bool override_cdn_hosts 1 && hosts_group="$hosts_group $CDN_HOSTS"; ip=$(best_ip com)
+        else
+            if ! cfg_bool "optimize_$g" 0; then check_row "$(group_label "$g")" skipped FEATURE_DISABLED '该平台优选已关闭'; continue; fi
+            hosts_group=$(configured_domains "$g"); ip=$(best_ip "$g")
         fi
         [ "$enabled" = 1 ] || continue
         if [ -z "$ip" ]; then check_row "节点 $g" unknown NO_SPEED_RESULT '尚无可用的节点结果，不能宣称固定 IP 已生效' '先完成有效测速'; continue; fi
         for host in $hosts_group; do
+            case "$g" in store|ps|xbox_old|switch)
+                if [ "$g" = ps ] && ! url=$(domain_url "$g" "$host"); then
+                    check_row "覆盖 $host" skipped RESOURCE_NOT_CONFIGURED '该域名的独立校验资源待配置；当前使用上游解析' '添加该域名的下载资源后重新测速'
+                    continue
+                fi
+                if ! pinned_domains "$g" | grep -qxF "$host"; then
+                    check_row "覆盖 $host" warn DOMAIN_NOT_OPTIMIZED '该域名尚待通过节点或增强资源校验；当前使用上游解析' '检查测速与校验链接并重新运行该平台测速'
+                    continue
+                fi ;;
+            esac
             if [ "$g" = cn ] || { [ "$mode" = optimize ] && echo "$COM_DOMAINS" | grep -qwF "$host"; }; then
                 if ! best_domains "$g" | grep -qwF "$host"; then
                     check_row "覆盖 $host" warn DOMAIN_NOT_OPTIMIZED '该域名兼容性校验失败，当前走默认上游' '检查该下载域名与选中节点的资源兼容性'
@@ -247,21 +285,23 @@ diagnostic_environment() {
     resources=$(groups_active)
     [ "$mode" = redirect ] && resources="$resources cn"
     for g in $(echo "$resources" | tr ' ' '\n' | uniq_keep_order); do
-        url=$(group_url "$g"); host=$(url_host "$url"); ip=$(best_ip "$g")
-        if [ -z "$ip" ]; then
-            directory="$work/resource-$g"
-            dns_capture a "$host" "$(cfg fallback_dns 223.5.5.5 | awk '{print $1}')" "$directory"
-            dns_parse a "$directory"; ip=$(echo "$DNS_VALUES" | awk '{print $1}')
+        if ! prepare_group_resource "$g"; then
+            check_row "测速链接 $(group_label "$g")" unknown "$GROUP_RESOURCE_CODE" "$GROUP_RESOURCE_MESSAGE" '检查商店链接接口、路由器时钟与自定义资源配置' measurement
+            continue
         fi
-        if [ -z "$ip" ]; then check_row "测试资源 $g" unknown RESOURCE_DNS_UNKNOWN '没有可用测试地址，不能确认资源有效' '检查上游 DNS；不要直接断定文件失效' measurement; continue; fi
-        got=$(probe "$ip" "$host" "$(url_path "$url")" "$(group_offset "$g")" 1024 3)
-        set -- $got
-        classification=$(probe_classify "${4:-0}" "${1:-000}" "$(to_int "$2")" 1024)
-        case "$classification" in
-        OK|TIME_LIMIT_WITH_DATA) check_row "测试资源 $g" ok RESOURCE_AVAILABLE "host=$host ip=$ip HTTP=$1 bytes=$2；资源可取样，Xbox 速度待实机测量" '' measurement ;;
-        HTTP_*|RANGE_INVALID|RANGE_IGNORED|INSUFFICIENT_DATA) check_row "测试资源 $g" warn "$classification" "host=$host ip=$ip HTTP=$1 bytes=$2；该节点资源校验不通过" "$(probe_advice "$classification")" measurement ;;
-        *) check_row "测试资源 $g" unknown "$classification" "curl_exit=$4 HTTP=$1 bytes=$2 connect_s=${5:-0} total_s=${6:-0} error=$(head -c 250 "$TMP_DIR/probe-error-$$.txt" 2>/dev/null)" "$(probe_advice "$classification")" measurement ;;
-        esac
+        url=$(group_url "$g"); ip=$(best_ip "$g")
+        case "$g" in cn|com) hosts_group=$(url_host "$url") ;; *) hosts_group=$(configured_domains "$g") ;; esac
+        for host in $hosts_group; do
+            if ! value=$(domain_url "$g" "$host" "$url"); then
+                if [ "$g" = switch ]; then
+                    case " $SWITCH_GAME_DOMAINS " in *" $host "*)
+                        check_row "游戏下载资源 $host" skipped OPTIONAL_GAME_RESOURCE '默认采用公开测速选中的节点映射；实际游戏资源增强校验可选' '可选填写该域名的实际游戏下载链接并保存应用' measurement ;;
+                    esac
+                fi
+                continue
+            fi
+            verify_resource_row "$g" "$host" "$value" "$ip" "$work"
+        done
     done
 
     # Check exact configured schedules, not merely that a line has our comment.
@@ -300,6 +340,7 @@ diagnostic_environment() {
         check_row 验收配置一致性 unknown CONFIG_CHANGED_DURING_CHECK '验收期间配置或节点发生变化，不能把混合结果视为当前配置成功' '保存配置后重新验收，不要在任务期间修改设置'
     fi
     check_row Xbox实际效果 unknown XBOX_NOT_OBSERVED '未连接 Xbox 的实际下载观测；路由器检测全通过也不等于提速' '在 Xbox 下载同一游戏，对比前后稳定速度与实际目标节点' xbox
+    check_row 平台设备实际效果 unknown CLIENTS_NOT_OBSERVED '微软商店、PlayStation 与 Switch 的实际下载节点及稳定速度待设备观测' '在对应设备下载同一资源，对比节点与稳定下载速度' clients
     json_close_array
     json_add_object summary
     if [ "$V_FAIL" -gt 0 ]; then value=failed;
@@ -307,7 +348,7 @@ diagnostic_environment() {
     elif [ "$V_UNKNOWN" -gt 0 ] || [ "$V_WARN" -gt 0 ]; then value=partial;
     elif [ -z "$hosts" ]; then value=unknown;
     else value=verified; fi
-    json_add_string router "$value"; json_add_string traffic unknown; json_add_string xbox unknown
+    json_add_string router "$value"; json_add_string traffic unknown; json_add_string xbox unknown; json_add_string clients unknown
     if [ "$M_FAIL" -gt 0 ]; then value=failed; elif [ "$M_UNKNOWN" -gt 0 ]; then value=unknown; elif [ "$M_PASS" -gt 0 ]; then value=verified; else value=skipped; fi
     json_add_string measurement "$value"
     if [ "$D_FAIL" -gt 0 ]; then value=failed; elif [ "$D_UNKNOWN" -gt 0 ]; then value=unknown; elif [ "$D_PASS" -gt 0 ]; then value=verified; else value=skipped; fi

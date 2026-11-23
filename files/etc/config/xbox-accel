@@ -13,6 +13,20 @@ config main 'main'
 	# 同时接管主机通过 SRV 记录拿到的 4 个备用 CDN 主机名
 	option override_cdn_hosts '1'
 
+	# 扩展平台独立选优，默认关闭
+	option optimize_store '0'
+	option optimize_ps '0'
+	option optimize_xbox_old '0'
+	option optimize_switch '0'
+	# store：微软商店应用；xbox：Xbox 应用。自动刷新带有效期的测速链接
+	option store_test_app 'store'
+	# 可选 test_url_store / test_url_ps / test_url_xbox_old / test_url_switch
+	# 可选 list extra_ips_<平台>：该组额外公网 IPv4 候选
+	# PS 按域名使用独立资源；可用 list verification_urls_ps 覆盖或补充
+	# Switch 默认把公开测速选中节点映射到游戏下载域名
+	# 游戏链接用于可选增强校验；失败时对应域名走上游，删除后恢复默认映射
+	# list verification_urls_switch 'https://atum.hac.lp1.d4c.nintendo.net/实际游戏资源路径'
+
 	# 运营商：auto（只按本线路发现候选）/ telecom / unicom / mobile
 	# 选了运营商后，会额外询问该运营商其他地区的节点来扩大候选范围
 	option isp 'auto'
@@ -26,6 +40,9 @@ config main 'main'
 	# 旧版 cron 保留兼容；schedule_type 缺失或为 legacy 时使用
 	option cron '15 5 * * *'
 	option health_interval '10'
+
+	# concise：任务与阶段摘要、节点变更、告警；detail：逐项诊断
+	option log_mode 'concise'
 
 	# 初筛与复测的单节点上限
 	option quick_size_mb '4'
