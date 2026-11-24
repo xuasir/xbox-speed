@@ -313,3 +313,58 @@ stop_redirect() {
     note '独立重定向进程仍存在，请检查服务停止错误'
     return 1
 }
+
+# ---------- LuCI Web 服务端口 ----------
+
+# 监听项形如 80、0.0.0.0:80、[::]:443 ssl；输出其中的端口号。
+listen_ports() {
+    tr -d "'" | awk '{value=$1; sub(/^.*:/, "", value); if (value ~ /^[0-9]+$/) print value}' | sort -u
+}
+
+uhttpd_main_ports() {
+    local newline='
+'
+    { uci -q -d "$newline" get uhttpd.main.listen_http; uci -q -d "$newline" get uhttpd.main.listen_https; } | listen_ports
+}
+
+nginx_ports() {
+    local server newline='
+'
+    {
+        for server in $(uci -q show nginx | sed -n 's/^nginx\.\([^.=]*\)=server$/\1/p'); do
+            uci -q -d "$newline" get "nginx.$server.listen"
+        done
+        sed -n 's/^[[:space:]]*listen[[:space:]][[:space:]]*\([^;]*\);.*/\1/p' /etc/nginx/uci.conf /etc/nginx/nginx.conf 2>/dev/null
+    } | listen_ports
+}
+
+# 主实例是否正在这些端口上提供服务；插件自己的重定向实例使用 1024 以上的专用端口。
+uhttpd_main_serving() {
+    local port
+    for port in "$@"; do
+        netstat -lntp 2>/dev/null | awk -v suffix=":$port" '$6=="LISTEN" && substr($4, length($4)-length(suffix)+1)==suffix && $NF ~ /\/uhttpd$/ {found=1} END {exit !found}' && return 0
+    done
+    return 1
+}
+
+# 固件由 Nginx 提供 LuCI 时，随依赖装入的 uhttpd 主实例默认监听相同端口且启动更早，
+# 重启后会顶替 Nginx。这里只取消冲突主实例的开机自启，正在提供页面的进程保持运行；
+# com→cn 重定向由插件自己的 procd 实例直接运行 uhttpd，不依赖主实例。
+web_guard() {
+    local port ports conflict=''
+    [ -x /etc/init.d/nginx ] && [ -x /etc/init.d/uhttpd ] && [ -f /etc/nginx/conf.d/luci.locations ] || return 0
+    /etc/init.d/nginx enabled >/dev/null 2>&1 && /etc/init.d/uhttpd enabled >/dev/null 2>&1 || return 0
+    ports=$(nginx_ports)
+    for port in $(uhttpd_main_ports); do
+        printf '%s\n' "$ports" | grep -qx "$port" && conflict="${conflict:+$conflict }$port"
+    done
+    [ -n "$conflict" ] || return 0
+    svc /etc/init.d/uhttpd disable || { note "uhttpd 主实例与 Nginx 端口冲突（${conflict}），取消其开机自启失败"; return 1; }
+    if uhttpd_main_serving $conflict; then
+        note "LuCI 应由 Nginx 提供，当前由端口冲突（${conflict}）的 uhttpd 主实例顶替：已取消其开机自启，重启路由器后恢复"
+    else
+        svc /etc/init.d/uhttpd stop || true
+        note "LuCI 由 Nginx 提供：已取消端口冲突（${conflict}）的 uhttpd 主实例开机自启，重定向功能不受影响"
+    fi
+    return 0
+}

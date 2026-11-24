@@ -32,6 +32,7 @@ POSTINST = '''#!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/xbox-accel enable
 /etc/init.d/rpcd reload
+/usr/bin/xbox-accel _web_guard || true
 rm -f /tmp/luci-indexcache*
 rm -rf /tmp/luci-modulecache
 [ "$(uci -q get xbox-accel.main.enabled)" = 1 ] && /etc/init.d/xbox-accel restart

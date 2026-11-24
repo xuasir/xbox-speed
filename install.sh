@@ -145,6 +145,8 @@ else
 fi
 /etc/init.d/xbox-accel enable
 refresh_luci
+# Nginx 提供 LuCI 的固件上，取消端口冲突的 uhttpd 主实例开机自启
+/usr/bin/xbox-accel _web_guard || true
 echo "  已安装 xbox-accel $(/usr/bin/xbox-accel --version)"
 
 if [ "$(uci -q get xbox-accel.main.enabled)" = 1 ]; then

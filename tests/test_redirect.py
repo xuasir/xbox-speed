@@ -22,7 +22,7 @@ def process_fixture(root, pid, web_root, inode, binary=b'uhttpd-fixture'):
 
 
 class RedirectTests(unittest.TestCase):
-    def shell(self, body, fixture=None, process_mock=False):
+    def shell(self, body, fixture=None, process_mock=False, web_mock=False):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             for name in ('state', 'run', 'config'):
@@ -33,12 +33,16 @@ class RedirectTests(unittest.TestCase):
             if process_mock:
                 library = root / 'redirect.sh'
                 library.write_text(LIB.read_text().replace('/proc/', 'proc/').replace('/usr/sbin/uhttpd', 'reference-uhttpd'))
+            if web_mock:
+                library = root / 'redirect.sh'
+                library.write_text(LIB.read_text().replace('/etc/init.d/', 'init.d/').replace('/etc/nginx/', 'nginx/'))
             helpers = f'''
 NAME=xbox-accel; STATE_DIR=state; RUN_DIR=run; REDIRECT_CONF=redirect.conf
 REDIRECT_ROOT={shlex.quote(WEB_ROOT)}; CGI_URL=/cgi-bin/xbox-accel-redirect
 cfg() {{ if [ -s "config/$1" ]; then cat "config/$1"; else printf '%s\\n' "$2"; fi; }}
 cfg_bool() {{ [ "$(cfg "$1" "$2")" = 1 ]; }}
 note() {{ printf '%s\\n' "$*" >&2; }}
+svc() {{ "$@"; }}
 . {shlex.quote(str(library))}
 '''
             result = subprocess.run(['sh', '-c', helpers + body], cwd=root,
@@ -165,6 +169,63 @@ command() { return 1; }
 redirect_backend; echo unavailable:$?
 ''')
         self.assertEqual(output, ['iptables', 'unavailable:1'])
+
+    WEB_STUBS = '''
+uci() {
+    case "$*" in
+    *'get uhttpd.main.listen_http') printf '%s\\n' $UHTTPD_HTTP ;;
+    *'get uhttpd.main.listen_https') printf '%s\\n' $UHTTPD_HTTPS ;;
+    *'show nginx') printf '%s\\n' 'nginx.global=main' "nginx._lan=server" "nginx._lan.listen='443 ssl default_server' '[::]:443 ssl default_server'" ;;
+    *'get nginx._lan.listen') printf '%s\\n' "'443 ssl default_server'" "'[::]:443 ssl default_server'" ;;
+    *) return 1 ;;
+    esac
+}
+netstat() { cat netstat.txt; }
+UHTTPD_HTTP='0.0.0.0:80 [::]:80'; UHTTPD_HTTPS='0.0.0.0:443 [::]:443'
+report() { web_guard 2>&1; echo "rc:$?"; cat calls 2>/dev/null; test -e state/uhttpd.enabled && echo autostart:kept || echo autostart:off; }
+'''
+
+    @staticmethod
+    def web_fixture(root, listener):
+        (root / 'init.d').mkdir()
+        (root / 'nginx/conf.d').mkdir(parents=True)
+        for name in ('nginx', 'uhttpd'):
+            script = root / 'init.d' / name
+            script.write_text('#!/bin/sh\nname=${0##*/}\ncase "$1" in\nenabled) [ -e "state/$name.enabled" ] ;;\n'
+                              'disable) rm -f "state/$name.enabled"; echo "$name $1" >> calls ;;\n*) echo "$name $1" >> calls ;;\nesac\n')
+            script.chmod(0o755)
+            (root / 'state' / f'{name}.enabled').touch()
+        (root / 'nginx/conf.d/luci.locations').write_text('location /cgi-bin/luci { }\n')
+        (root / 'nginx/uci.conf').write_text('server {\n\t\tlisten 80 default_server;\n\t\tlisten [::]:80 default_server;\n\t\tlisten unix:/var/run/x.sock;\n}\n')
+        (root / 'netstat.txt').write_text(
+            f'tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN      {listener}\n'
+            'tcp        0      0 127.0.0.1:18081         0.0.0.0:*               LISTEN      900/uhttpd\n')
+
+    def test_web_guard_releases_nginx_ports_from_dependency_uhttpd(self):
+        output = self.shell(self.WEB_STUBS + '''
+nginx_ports | tr '\\n' ' '; echo
+report
+''', lambda root: self.web_fixture(root, '786/nginx: master pro'), web_mock=True)
+        self.assertEqual(output[0].split(), ['443', '80'])
+        self.assertIn('已取消端口冲突（443 80）的 uhttpd 主实例开机自启', output[1])
+        self.assertEqual(output[2:], ['rc:0', 'uhttpd disable', 'uhttpd stop', 'autostart:off'])
+
+    def test_web_guard_keeps_serving_uhttpd_running_until_reboot(self):
+        output = self.shell(self.WEB_STUBS + 'report\n', lambda root: self.web_fixture(root, '1775/uhttpd'), web_mock=True)
+        self.assertIn('重启路由器后恢复', output[0])
+        self.assertEqual(output[1:], ['rc:0', 'uhttpd disable', 'autostart:off'])
+
+    def test_web_guard_leaves_unrelated_web_setups_untouched(self):
+        output = self.shell(self.WEB_STUBS + '''
+UHTTPD_HTTP='0.0.0.0:8080'; UHTTPD_HTTPS=''; report
+UHTTPD_HTTP='0.0.0.0:80'
+rm state/uhttpd.enabled; report; touch state/uhttpd.enabled
+rm state/nginx.enabled; report; touch state/nginx.enabled
+mv nginx/conf.d/luci.locations hidden; report; mv hidden nginx/conf.d/luci.locations
+mv init.d/nginx init.d/nginx.absent; report
+''', lambda root: self.web_fixture(root, '1775/uhttpd'), web_mock=True)
+        self.assertEqual(output, ['rc:0', 'autostart:kept', 'rc:0', 'autostart:off', 'rc:0', 'autostart:kept',
+                                  'rc:0', 'autostart:kept', 'rc:0', 'autostart:kept'])
 
 
 if __name__ == '__main__':

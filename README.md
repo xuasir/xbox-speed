@@ -47,6 +47,8 @@ opkg install /root/luci-app-xbox-accel_0.3.0-1_all.ipk
 
 依赖由 opkg 安装：`luci-base`、`rpcd`、`curl`、`ca-bundle`、`uhttpd`、`jshn`、`conntrack`。运行环境使用现有标准 dnsmasq 或 dnsmasq-full；BusyBox 提供 flock、nslookup 等标准命令。
 
+由 Nginx 提供 LuCI 的固件（如 Kwrt）上，随依赖装入的 uhttpd 主实例默认同样监听 80/443 且启动更早，重启后会顶替 Nginx。安装脚本检测到这种端口冲突时取消 uhttpd 主实例的开机自启，正在提供页面的进程保持运行；若 LuCI 已被 uhttpd 顶替，升级后重启一次路由器即恢复。com→cn 重定向使用插件自己的 uhttpd 实例，不受影响。端口不冲突或固件本身使用 uhttpd 时不做任何改动。
+
 旧版升级时若出现多个 `flock 1000` 持续等待，请按[服务锁恢复步骤](docs/UPGRADE_LOCK_RECOVERY.md)修补现有脚本、重启路由器，再安装包含修复的软件包。
 
 安装后刷新或重新登录 LuCI，进入 **服务 → Xbox 下载加速**。**默认未启用**，首次安装不会添加主 DNS 规则、修改 Web 配置或创建测速计划。

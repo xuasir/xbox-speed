@@ -50,6 +50,7 @@ define Package/luci-app-xbox-accel/postinst
 [ -n "$$IPKG_INSTROOT" ] && exit 0
 /etc/init.d/xbox-accel enable
 /etc/init.d/rpcd restart
+/usr/bin/xbox-accel _web_guard || true
 [ "$$(uci -q get xbox-accel.main.enabled)" = 1 ] && /etc/init.d/xbox-accel restart
 exit 0
 endef

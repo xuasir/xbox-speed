@@ -1762,6 +1762,7 @@ esac
 case "$1" in
 _stop_redirect) stop_redirect; exit $? ;;
 _restore_redirect) restore_redirect_firewall; exit $? ;;
+_web_guard) web_guard; exit $? ;;
 esac
 [ -r "$SHARE_DIR/platforms.sh" ] || { echo '错误：平台模块缺失，请重新安装插件' >&2; exit 1; }
 . "$SHARE_DIR/platforms.sh"
