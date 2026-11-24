@@ -8,7 +8,7 @@ application_report_document() {
 }
 
 append_application_summary() {
-    local old="${JSON_PREFIX:-}" document checked signature status router measurement direct_set passed failed unknown warnings stale=1
+    local old="${JSON_PREFIX:-}" document checked signature status router measurement direct_set traffic clients passed failed unknown warnings stale=1
     if [ ! -s "$TMP_DIR/last-application.json" ] && [ -s "$STATE_DIR/last-application.json" ]; then
         mkdir -p "$TMP_DIR"
         cp "$STATE_DIR/last-application.json" "$TMP_DIR/last-application.json" 2>/dev/null || true
@@ -22,6 +22,8 @@ append_application_summary() {
             json_get_var status router; json_get_var passed passed; json_get_var failed failed
             json_get_var unknown unknown; json_get_var warnings warnings
             json_get_var measurement measurement; json_get_var direct_set direct_set
+            json_get_var traffic traffic; json_get_var clients clients
+            json_select ..
         fi
     fi
     router=${status:-none}
@@ -34,11 +36,19 @@ append_application_summary() {
     json_add_object last_application
     json_add_string status "${status:-none}"; json_add_int checked_at "$(to_int "$checked")"
     json_add_string router "$router"; json_add_string measurement "${measurement:-skipped}"; json_add_string direct_set "${direct_set:-skipped}"
+    json_add_string traffic "${traffic:-unknown}"; json_add_string clients "${clients:-unknown}"
     json_add_boolean stale "$stale"; json_add_boolean available "$([ -s "$TMP_DIR/last-application.json" ] && echo 1 || echo 0)"
+    json_add_boolean same_configuration "$( [ -n "$signature" ] && [ "$signature" = "$(configuration_signature)" ] && echo 1 || echo 0 )"
+    json_set_namespace XA_APPLICATION_META_
+    if json_select summary >/dev/null 2>&1 && json_select groups >/dev/null 2>&1; then
+        json_set_namespace "$old"
+        json_add_object groups; json_copy_current XA_APPLICATION_META_ "$old"; json_close_object
+    fi
+    json_set_namespace "$old"
     json_add_int passed "$(to_int "$passed")"; json_add_int failed "$(to_int "$failed")"
     json_add_int unknown "$(to_int "$unknown")"; json_add_int warnings "$(to_int "$warnings")"
     json_add_string file "$TMP_DIR/last-application.json"
-    json_add_string limitation '历史验收只代表检测时刻；配置改变或时间过期需重验，Xbox 始终待实机确认'
+    json_add_string limitation '配置验收对应检测时刻；设备连接实时更新，速度效果需同资源对比'
     json_close_object
 }
 
@@ -71,7 +81,7 @@ application_from_report() {
     fi
     TASK_APPLY_STATUS=$status
     case "$status" in
-    verified) TASK_APPLY_CODE=ROUTER_VERIFIED; TASK_APPLY_MESSAGE='路由器配置及读回验收通过；真实客户端路径和 Xbox 效果仍未知' ;;
+    verified) TASK_APPLY_CODE=ROUTER_VERIFIED; TASK_APPLY_MESSAGE='配置和 DNS 验收通过；设备下载证据见总览与验收详情' ;;
     disabled) TASK_APPLY_STATUS=skipped; TASK_APPLY_CODE=DISABLED; TASK_APPLY_MESSAGE='插件未启用，未验证下载链路' ;;
     failed) TASK_APPLY_CODE=ROUTER_FAILED; TASK_APPLY_MESSAGE='路由器验收失败，查看失败项' ;;
     *) TASK_APPLY_STATUS=partial; TASK_APPLY_CODE=ROUTER_NOT_FULLY_VERIFIED; TASK_APPLY_MESSAGE='存在警告、未覆盖或未知项，不能宣称完全成功' ;;
@@ -147,7 +157,7 @@ verify_disabled() {
 $(pending_cleanup_rules)"; then
         check_row 撤销DNS副本 fail DNS_COPY_RULES_REMAIN 'Passwall 的 DNS 副本仍保留已撤销的转发规则' '检查 Passwall 重载日志并重新应用';
     else check_row 撤销DNS副本 ok DNS_COPY_RULES_REMOVED '已识别的 Passwall DNS 副本已清理转发规则'; fi
-    check_row Xbox效果 unknown XBOX_NOT_OBSERVED '停用验收不代表普通 DNS 或 Xbox 下载已测试' '' xbox
+    check_row 下载速度效果 unknown PERFORMANCE_COMPARISON_PENDING '加速已关闭，下载速度可由设备使用同一资源对比' '' xbox
     json_close_array; json_add_object summary
     if [ "$V_FAIL" -gt 0 ]; then json_add_string router failed;
     elif [ "$V_UNKNOWN" -gt 0 ]; then json_add_string router partial;

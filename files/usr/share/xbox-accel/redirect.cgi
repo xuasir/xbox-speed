@@ -25,4 +25,10 @@ if [ "$(printf '%s' "$uri" | LC_ALL=C tr -d '\000-\037\177')" != "$uri" ]; then
 	exit 0
 fi
 case "$uri" in /*) ;; *) uri=/ ;; esac
+# 仅记录设备、白名单域名和时间，资源路径与签名继续留在请求中。
+case "$REMOTE_ADDR" in ''|127.*|::1|*[!0-9a-fA-F:.]*) ;; *)
+	if [ "${#REMOTE_ADDR}" -le 45 ] && [ -d /tmp/xbox-accel ]; then
+		printf '%s %s %s %s\n' "$(date +%s)" "$REMOTE_ADDR" "$host" "$target" >>/tmp/xbox-accel/redirect-observation.log
+	fi ;;
+esac
 printf 'Status: 302 Found\r\nLocation: http://%s%s\r\nContent-Length: 0\r\n\r\n' "$target" "$uri"

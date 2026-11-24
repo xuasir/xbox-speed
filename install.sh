@@ -28,6 +28,9 @@ FILES="
 /usr/share/xbox-accel/application.sh
 /usr/share/xbox-accel/privacy.sh
 /usr/share/xbox-accel/quick-check.sh
+/usr/share/xbox-accel/measurement.sh
+/usr/share/xbox-accel/records.sh
+/usr/share/xbox-accel/observation.sh
 /usr/libexec/rpcd/xbox-accel
 /usr/share/luci/menu.d/luci-app-xbox-accel.json
 /usr/share/rpcd/acl.d/luci-app-xbox-accel.json
@@ -111,6 +114,7 @@ echo "== 依赖"
 echo "  dnsmasq：$(/usr/sbin/dnsmasq -v | awk 'NR==1{print $3}')"
 command -v flock >/dev/null 2>&1 || { echo "  缺少 flock（通常由 BusyBox 提供）" >&2; exit 1; }
 need "curl" "command -v curl" curl
+need "下载连接观测" "command -v conntrack" conntrack
 need "HTTPS CA 证书" "test -s /etc/ssl/certs/ca-certificates.crt" ca-bundle
 need "jshn" "test -f /usr/share/libubox/jshn.sh" jshn
 need "rpcd" "test -x /sbin/rpcd" rpcd
@@ -152,6 +156,7 @@ cat <<'TIP'
 
 安装完成。插件默认不启用，此时没有改动任何系统配置。
   网页：LuCI → 服务 → Xbox 下载加速（看不到菜单时请重新登录 LuCI）
-  命令：xbox-accel check     环境检测
-        xbox-accel enable    启用（会自动开始第一次测速）
+  命令：xbox-accel measure ps  独立测速（支持关闭的平台）
+        xbox-accel check       检查生效
+        xbox-accel enable      启用（缺少节点时自动首次选优）
 TIP

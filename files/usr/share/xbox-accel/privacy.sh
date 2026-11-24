@@ -73,6 +73,16 @@ build_redacted_report() {
         json_append_document last_test "$(last_speed_document)" 1
         json_append_document current_checks "$checks"
         json_append_document last_application "$(application_report_document)"
+        json_append_document recent_records "$(json_records)"
+        # 设备名称留在本地界面，导出保留连接证据并交给统一地址脱敏。
+        json_set_namespace XA_EXPORT_OBSERVATION_
+        if json_load "$(observation_document)" 2>/dev/null; then
+            json_set_namespace ""
+            json_add_object observation
+            json_copy_current XA_EXPORT_OBSERVATION_ "" devices
+            json_close_object
+        fi
+        json_set_namespace ""
         json_add_object configuration
         for key in enabled autostart optimize_cn optimize_com redirect_cn redirect_ip redirect_port isp resolver_port dnsmasq_instance ttl cron schedule_type schedule_time schedule_weekday schedule_monthday health_interval log_mode quick_size_mb quick_time full_size_mb full_time max_candidates top_n switch_threshold passwall_direct passwall_restart override_cdn_hosts; do
             json_add_string "$key" "$(cfg "$key" '')"

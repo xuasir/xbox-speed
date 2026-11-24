@@ -10,7 +10,7 @@ quick_environment() {
     check_row 系统 info SYSTEM_INFO "$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION $DISTRIB_ARCH")" '' context
     check_row 路由器时间 info ROUTER_TIME "$(date '+%Y-%m-%d %H:%M:%S %Z')" '' context
     missing=""
-    for key in dnsmasq curl flock nslookup uci ubus netstat; do command -v "$key" >/dev/null 2>&1 || missing="$missing $key"; done
+    for key in dnsmasq curl flock nslookup uci ubus netstat conntrack; do command -v "$key" >/dev/null 2>&1 || missing="$missing $key"; done
     if [ -n "$missing" ]; then check_row 依赖 fail DEPENDENCY_MISSING "缺少:$missing" '重新安装依赖'; else check_row 依赖 ok DEPENDENCIES_READY '所需命令已安装'; fi
     if value=$( (validate_config) 2>&1); then check_row 配置 ok CONFIG_VALID '参数格式有效，不等于已生效'; else check_row 配置 fail CONFIG_INVALID "$value" '修改对应字段后保存并应用'; fi
     if ! is_enabled; then check_row 解析服务 skipped PLUGIN_DISABLED '插件未启用';
@@ -40,12 +40,15 @@ quick_environment() {
     check_row 原有上游 info UPSTREAM_CONFIGURATION "普通上游:${value:-resolvfile或分流设置}；本插件没有替换全局上游" '' context
     if is_enabled; then
         value="$(schedule_cron) /usr/bin/xbox-accel start_test all scheduled >/dev/null 2>&1 $CRON_TAG"
-        if ! grep -qxF "$value" "$CRON_FILE" 2>/dev/null; then check_row 定时完整测速 fail CRON_MISMATCH '实际计划不匹配当前配置' '重新应用';
+        if [ "$(cfg schedule_type legacy)" = off ]; then
+            if grep -F 'start_test all scheduled' "$CRON_FILE" 2>/dev/null | grep -F "$CRON_TAG" >/dev/null; then check_row 定时完整测速 fail CRON_MISMATCH '仍有插件的定时测速条目' '重新应用';
+            else check_row 定时完整测速 skipped FEATURE_DISABLED '仅手动测速'; fi
+        elif ! grep -qxF "$value" "$CRON_FILE" 2>/dev/null; then check_row 定时完整测速 fail CRON_MISMATCH '实际计划不匹配当前配置' '重新应用';
         elif ! pidof crond >/dev/null 2>&1; then check_row 定时完整测速 fail CRON_STOPPED 'cron 进程不存在' '启动 cron';
         else check_row 定时完整测速 ok CRON_CONFIG_VERIFIED "$(schedule_label)；健康检查$(health_label)；执行是否成功看最近测速摘要"; fi
     else check_row 定时任务 skipped PLUGIN_DISABLED '插件未启用'; fi
-    check_row 完整链路验收 unknown NOT_RUN_IN_PREFLIGHT '初查不下载资源，也不逐域名验证 DNS/SRV/AAAA/302' '点击“一键完整验收”，后台完成后查看报告'
-    check_row Xbox实际效果 unknown XBOX_NOT_OBSERVED '未观测 Xbox 实际下载' '实机比较稳定下载速度及目标节点' xbox
+    check_row 完整链路验收 unknown NOT_RUN_IN_PREFLIGHT '初查已完成，DNS、资源和实际连接详情由完整验收提供' '点击“检查生效”，完成后查看报告'
+    check_row 下载速度效果 unknown PERFORMANCE_COMPARISON_PENDING '提速幅度等待设备对比，实时节点命中见总览' '比较同一资源的稳定下载速度' xbox
     json_close_array; json_add_object summary
     [ "$V_FAIL" -eq 0 ] && json_add_string router unknown || json_add_string router failed
     json_add_string xbox unknown; json_close_object; json_dump

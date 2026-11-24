@@ -131,6 +131,7 @@ case "$LOG_MODE" in concise|detail) ;; *) LOG_MODE=concise ;; esac
 schedule_cron() {
 	local kind time day
 	kind=$(cfg schedule_type legacy)
+	[ "$kind" = off ] && return 0
 	[ "$kind" = legacy ] && { cfg cron '15 5 * * *'; return; }
 	case "$kind" in daily|weekly|monthly) ;; *) return 1 ;; esac
 	time=$(cfg schedule_time '05:15')
@@ -151,6 +152,7 @@ schedule_cron() {
 
 schedule_label() {
 	local plan
+	[ "$(cfg schedule_type legacy)" = off ] && { echo '仅手动测速'; return; }
 	plan=$(schedule_cron) || { echo '测速计划设置无效'; return; }
 	case "$plan" in
 	'*/30 * * * *') echo '每 30 分钟（每小时 00、30 分）' ;;
@@ -279,6 +281,7 @@ validate_config() {
 		[ "$(printf '%s' "$s" | ipv4s | public_only)" = "$s" ] || die "fallback_dns 只允许公网 IPv4，避免回环"
 	done
 	schedule=$(schedule_cron) || die "定时测速计划无效：检查频率、HH:MM、星期几或每月日期"
+	if [ "$(cfg schedule_type legacy)" != off ]; then
 	[ "$(printf '%s' "$schedule" | tr -d '0-9*/ ,\055')" = "" ] || die "cron 含非法字符"
 	set -f
 	set -- $schedule
@@ -296,6 +299,7 @@ validate_config() {
 	 } return 1;
 	}
 	{exit !(NF==5&&valid($1,0,59)&&valid($2,0,23)&&valid($3,1,31)&&valid($4,1,12)&&valid($5,0,7))}' || die "cron 字段值或范围无效"
+	fi
 	for g in cn com; do
 		url=$(group_url "$g")
 		host=$(url_host "$url")
@@ -462,6 +466,7 @@ stage_run() {
 	local out=$1 minb=$2 bytes=$3 tmo=$4 host=$5 path=$6 off=$7 ip r code got speed rc classification message failure_codes="" failure_counts log_failure
 	shift 7
 	STAGE_VALID=0; STAGE_TOTAL=0; STAGE_LAST_CODE=NONE
+	TASK_PROGRESS_TOTAL=$#; TASK_PROGRESS_DONE=0; TASK_PROGRESS_VALID=0
 	: >"$out"
 	for ip in "$@"; do
 		STAGE_TOTAL=$((STAGE_TOTAL+1))
@@ -487,6 +492,8 @@ stage_run() {
 			failure_codes="$failure_codes $classification"
 			;;
 		esac
+		TASK_PROGRESS_DONE=$STAGE_TOTAL; TASK_PROGRESS_VALID=$STAGE_VALID
+		task_snapshot 0
 	done
 	if [ -n "$failure_codes" ] && [ "$LOG_MODE" = concise ]; then
 		failure_counts=$(printf '%s\n' "$failure_codes" | awk '{for(i=1;i<=NF;i++){if(!count[$i]++) order[++n]=$i}} END{for(i=1;i<=n;i++) printf "%s%s=%d",(i>1?" ":""),order[i],count[order[i]]}')
@@ -543,7 +550,7 @@ test_group() {
 		task_event ERROR NO_CANDIDATES "group=$group"
 		return 1
 	fi
-	passwall_direct $cands
+	[ "${TEST_MODE:-apply}" = measure ] || passwall_direct $cands
 	task_stage "quick_$group"
 	say "[$group] 初筛 $count 个候选（每个最多 $(cfg quick_size_mb 4) MB / ${qt} 秒）"
 	stage_run "$q" 131072 "$qb" "$qt" "$host" "$path" "$off" $cands
@@ -564,7 +571,7 @@ test_group() {
 	best=$(sort -rn "$f" | head -n 1); best_speed=${best%% *}; best_ip_=${best##* }
 	chosen=$best_ip_; chosen_speed=$best_speed; cur_speed=""
 	[ -n "$cur" ] && cur_speed=$(awk -v ip="$cur" '$2==ip{print $1; exit}' "$f")
-	if [ -n "$cur_speed" ] && [ "$cur" != "$best_ip_" ] && [ $((best_speed * 100)) -le $((cur_speed * (100 + thr))) ]; then
+	if [ "${TEST_MODE:-apply}" != measure ] && [ -n "$cur_speed" ] && [ "$cur" != "$best_ip_" ] && [ $((best_speed * 100)) -le $((cur_speed * (100 + thr))) ]; then
 		chosen=$cur; chosen_speed=$cur_speed
 		say "[$group] 最快节点 $best_ip_ 未超过当前节点 ${thr}%，保持 $cur"
 	fi
@@ -574,11 +581,13 @@ test_group() {
 		group_report "$group" failed PRIMARY_DOMAIN_FAILED '选中节点未通过主下载域名资源校验；旧配置保留' "" 0 "$count" "$STAGE_VALID"
 		return 1
 	fi
-	if ! commit_group_result "$group" "$chosen" "$doms"; then
+	if [ "${TEST_MODE:-apply}" != measure ] && ! commit_group_result "$group" "$chosen" "$doms"; then
 		group_report "$group" failed STATE_COMMIT_FAILED '节点状态提交失败，已恢复原分组结果；检查存储空间与权限' "" 0 "$count" "$STAGE_VALID"
 		return 1
 	fi
-	printf '%s %s %s\n' "$chosen" "$chosen_speed" "$(date +%s)" >"$TMP_DIR/last_$group"
+	if [ "${TEST_MODE:-apply}" != measure ]; then
+		printf '%s %s %s\n' "$chosen" "$chosen_speed" "$(date +%s)" >"$TMP_DIR/last_$group"
+	fi
 	for d in $(configured_domains "$group"); do
 		resource=$(domain_url "$group" "$d" "$url") || continue
 		printf '%s\n' $doms | grep -qxF "$d" || missing="$missing $d"
@@ -589,7 +598,16 @@ test_group() {
 	else
 		group_report "$group" success SELECTED "主资源采样通过；已准备接管域名=$doms；尚需应用后验收" "$chosen" "$chosen_speed" "$count" "$STAGE_VALID"
 	fi
-	task_event INFO NODE_SELECTED "group=$group old_ip=${cur:--} selected_ip=$chosen speed=$(fmt_speed "$chosen_speed") domains=$doms"
+	if [ "${TEST_MODE:-apply}" = measure ]; then
+		if ! save_measurement "$group" "$chosen" "$chosen_speed" "$doms" "$count" "$STAGE_VALID" "$TEST_GROUP_PARTIAL"; then
+			group_report "$group" failed MEASUREMENT_SAVE_FAILED '测速结果保存失败，请检查存储空间'
+			return 1
+		fi
+		group_report "$group" "$([ "$TEST_GROUP_PARTIAL" = 1 ] && echo partial || echo success)" MEASUREMENT_READY '测速结果已保存，可在结果中选择采用' "$chosen" "$chosen_speed" "$count" "$STAGE_VALID"
+		task_event INFO MEASUREMENT_READY "group=$group measured_ip=$chosen speed=$(fmt_speed "$chosen_speed")"
+	else
+		task_event INFO NODE_SELECTED "group=$group old_ip=${cur:--} selected_ip=$chosen speed=$(fmt_speed "$chosen_speed") domains=$doms"
+	fi
 	return 0
 }
 
@@ -618,7 +636,7 @@ lock() {
 	flock -n 8 || die "已有测速或健康检查正在运行"
 	echo $$ >"$RUN_DIR/task.pid"
 	LOG_ACTIVE=1
-	trap 'task_on_exit $?; rm -f "$RUN_DIR/task.pid"; rm -rf "$TMP_DIR"/discover.*; rm -f "$TMP_DIR/probe-error-$$.txt"' EXIT
+	trap 'task_exit_rc=$?; measurement_cleanup || task_exit_rc=1; task_on_exit "$task_exit_rc"; rm -f "$RUN_DIR/task.pid"; rm -rf "$TMP_DIR"/discover.*; rm -f "$TMP_DIR/probe-error-$$.txt"' EXIT
 	trap 'TASK_STATUS=cancelled; TASK_CODE=CANCELLED; TASK_MESSAGE=任务被用户或服务停止; exit 130' INT TERM
 }
 
@@ -636,8 +654,12 @@ apply_lock() {
 
 # 后台任务交给 procd 运行，不依赖浏览器页面或 SSH 会话
 start_task() {
-	local kind=${1:-all} trigger=${2:-manual_cli}
-	case "$kind" in all | cn | com | store | ps | xbox_old | switch | apply | restart | verify | report) ;; *) die "未知任务：$kind" ;; esac
+	local kind=${1:-all} trigger=${2:-manual_cli} selection=${3:-} result_id=${4:-}
+	case "$kind" in all | cn | com | store | ps | xbox_old | switch | apply | restart | verify | report | measure | adopt) ;; *) die "未知任务：$kind" ;; esac
+	case "$kind" in
+	measure) measurement_groups "${selection:-all}" >/dev/null || die '请选择有效的测速平台' ;;
+	adopt) group_valid "$selection" || die '采用结果的平台无效'; printf '%s\n' "$result_id" | grep -qE '^[0-9]{8}T[0-9]{6}-[0-9]+$' || die '请选择当前测速结果' ;;
+	esac
 	mkdir -p "$RUN_DIR"
 	exec 9>"$RUN_DIR/launch.lock"
 	flock -n 9 || die "另一个任务正在启动"
@@ -658,7 +680,7 @@ start_task() {
 	. /lib/functions/procd.sh
 	procd_open_service xbox-accel-task /usr/bin/xbox-accel
 	procd_open_instance worker
-	procd_set_param command /usr/bin/xbox-accel _worker "$kind" "$trigger" "$TASK_ID"
+	procd_set_param command /usr/bin/xbox-accel _worker "$kind" "$trigger" "$TASK_ID" "$selection" "$result_id"
 	procd_set_param env PATH="$PATH"
 	procd_set_param stderr 1
 	procd_close_instance
@@ -792,6 +814,8 @@ gen_resolver_conf() {
 	echo "cache-size=0"
 	echo "local-ttl=$(to_int "$(cfg ttl 30)")"
 	echo "pid-file=$RUN_DIR/dnsmasq.pid"
+	echo 'log-queries'
+	echo "log-facility=$TMP_DIR/dns-observation.log"
 	# 没有被固定的域名照常向这些 DNS 查询
 	for s in $(cfg fallback_dns "223.5.5.5 119.29.29.29" | tr ' ' '\n' | ipv4s); do
 		echo "server=$s"
@@ -1466,7 +1490,9 @@ json_status() {
 	else json_add_string log_source none; fi
 	json_append_document last_task "$(last_task_document)" 1
 	json_append_document last_test "$(last_speed_document)" 1
+	append_measurements
 	append_application_summary
+	json_append_document observation "$(observation_document)"
 	json_add_boolean report_ready "$(report_available && echo 1 || echo 0)"
 	json_add_string report_file "$REPORT_FILE"
 	json_dump
@@ -1488,18 +1514,25 @@ json_env() {
 # ---------- 命令 ----------
 
 cmd_test() {
-	local g only=${1:-all} success=0 failed=0 partial=0 result=1 application_rc=0
-	TASK_KIND=test
+	local g only=${1:-all} intent=${2:-apply} groups success=0 failed=0 partial=0 result=1 application_rc=0
+	TEST_MODE=$intent; TASK_KIND=test
+	[ "$intent" = measure ] && TASK_KIND=measure
 	lock
 	task_begin
 	[ "$TASK_MEMORY_READY" = 1 ] || die "无法记录任务摘要，已停止测速"
 	task_stage configuration
 	TASK_CODE=CONFIG_INVALID; TASK_MESSAGE='配置校验未通过'
-	validate_config
-	case "$only" in all|cn|com|store|ps|xbox_old|switch) ;; *) die "未知测速组：$only" ;; esac
+	if [ "$intent" = measure ]; then
+		groups=$(measurement_groups "$only") || die '请选择有效的测速平台'
+		validate_measurement_config "$groups"
+	else
+		validate_config
+		case "$only" in all|cn|com|store|ps|xbox_old|switch) ;; *) die "未知测速组：$only" ;; esac
+		groups=$(groups_active)
+	fi
 	TASK_CODE=RUNNING
-	for g in $(groups_enabled); do
-		[ "$only" != all ] && [ "$only" != "$g" ] && continue
+	for g in $groups; do
+		[ "$intent" != measure ] && [ "$only" != all ] && [ "$only" != "$g" ] && continue
 		if test_group "$g"; then success=$((success+1)); partial=$((partial+${TEST_GROUP_PARTIAL:-0})); else failed=$((failed+1)); fi
 	done
 	if [ "$success" -eq 0 ]; then
@@ -1510,7 +1543,9 @@ cmd_test() {
 		fi
 		return 1
 	fi
-	if is_enabled; then
+	if [ "$intent" = measure ]; then
+		TASK_APPLY_STATUS=skipped; TASK_APPLY_CODE=MEASUREMENT_ONLY; TASK_APPLY_MESSAGE='独立测速结果已保存，采用结果时应用配置'
+	elif is_enabled; then
 		task_stage apply
 		apply; application_rc=$?
 		if [ "$application_rc" = 1 ]; then
@@ -1523,7 +1558,8 @@ cmd_test() {
 	if [ "$failed" -gt 0 ] || [ "$partial" -gt 0 ] || [ "$application_rc" = 2 ]; then
 		TASK_STATUS=partial; TASK_CODE=PARTIAL_RESULT; TASK_MESSAGE='部分组失败或配置尚未全部验收；查看分组与验收详情'; result=2
 	else
-		TASK_STATUS=success; TASK_CODE=TEST_COMPLETED; TASK_MESSAGE='采样完成，路由器验收或未应用状态见明细；客户端实际提速待设备验证'; result=0
+		TASK_STATUS=success; TASK_CODE=TEST_COMPLETED; TASK_MESSAGE='采样完成，应用和设备下载状态见总览'; result=0
+		[ "$intent" != measure ] || { TASK_CODE=MEASUREMENT_READY; TASK_MESSAGE='独立测速完成，请在结果中选择采用'; }
 	fi
 	task_stage finished
 	say "测速结束：status=$TASK_STATUS success_groups=$success failed_groups=$failed"
@@ -1698,7 +1734,10 @@ xbox-accel $VERSION
 
 用法：xbox-accel <命令>
   test [cn|com|store|ps|xbox_old|switch]  发现候选节点、测速、选优并应用
-  start_test     同上，但作为后台任务运行（定时任务和 LuCI 用的就是它）
+  start_test     后台自动选优并应用，供计划任务和旧版 CLI 使用
+  measure [平台,平台|all]  独立测速并保存候选，支持关闭的功能
+  start_measure  后台独立测速
+  start_adopt <平台> <结果ID>  启用功能、采用候选并验收
   cancel         停止正在运行的后台任务
   status         查看当前模式、节点和解析结果
   check          环境检测：DNS 链路、解析结果、重定向、定时任务、Passwall
@@ -1731,13 +1770,14 @@ if [ ! -r "$SHARE_DIR/diagnostics.sh" ]; then
 	exit 1
 fi
 . "$SHARE_DIR/diagnostics.sh"
-for diagnostic_module in verification application privacy quick-check; do
+for diagnostic_module in verification application privacy quick-check measurement records observation; do
 	[ -r "$SHARE_DIR/$diagnostic_module.sh" ] || { echo "错误：诊断模块 $diagnostic_module 缺失，请重新安装" >&2; exit 1; }
 	. "$SHARE_DIR/$diagnostic_module.sh"
 done
 
 case "$1" in
 test) cmd_test "$2" ;;
+measure) cmd_test "${2:-all}" measure ;;
 health) cmd_health ;;
 status) cmd_status ;;
 check) cmd_check ;;
@@ -1749,14 +1789,19 @@ start_test)
 	validate_config
 	start_task "${2:-all}" "${3:-manual_cli}"
 	;;
+start_measure) start_task measure "${3:-manual_cli}" "${2:-all}" ;;
+start_adopt) start_task adopt "${4:-manual_ui}" "$2" "$3" ;;
 clear_log)
 	mkdir -p "$TMP_DIR"
 	: >"$LOG_FILE"
 	rm -f "$STATE_DIR/activity-last.log"
+	clear_event_records
 	;;
 json_status) json_status ;;
 json_env) json_env ;;
 json_preflight) quick_environment ;;
+json_records) json_records ;;
+_observe) observation_loop ;;
 start_apply)
 	missing=0
 	if is_enabled; then for group in $(groups_active); do group_result_ready "$group" || missing=1; done; fi
@@ -1773,6 +1818,8 @@ _worker)
 	case "$2" in
 	apply|restart|verify) cmd_application_task "$2" ;;
 	report) cmd_report_task ;;
+	measure) cmd_test "${5:-all}" measure ;;
+	adopt) cmd_adopt_measurement "$5" "$6" ;;
 	*) TASK_KIND=test; cmd_test "$2" ;;
 	esac
 	;;

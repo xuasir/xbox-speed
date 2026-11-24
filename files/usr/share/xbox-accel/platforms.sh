@@ -291,10 +291,11 @@ platform_config_keys() {
     echo 'optimize_store optimize_ps optimize_xbox_old optimize_switch store_test_app test_url_store test_url_ps test_url_xbox_old test_url_switch test_offset_store test_offset_ps test_offset_xbox_old test_offset_switch verification_urls_ps verification_urls_switch extra_ips_store extra_ips_ps extra_ips_xbox_old extra_ips_switch'
 }
 
-validate_platform_config() {
-    local g url key count host
-    case "$(cfg store_test_app store)" in store|xbox) ;; *) die '商店测速应用请选择 store 或 xbox' ;; esac
-    for g in $PLATFORM_GROUPS; do
+validate_platform_group() {
+    local g=$1 url key count=0 host
+    if [ "$g" = store ]; then
+        case "$(cfg store_test_app store)" in store|xbox) ;; *) die '商店测速应用请选择 store 或 xbox' ;; esac
+    fi
         case "$(cfg "optimize_$g" 0)" in 0|1) ;; *) die "optimize_$g 必须是 0 或 1" ;; esac
         url=$(cfg "test_url_$g" '')
         [ -z "$url" ] || platform_url_valid "$g" "$url" || die "$(group_label "$g") 测速链接必须使用该平台已知下载域名和 HTTP(S) 资源路径"
@@ -307,9 +308,7 @@ validate_platform_config() {
         for url in $(cfg "extra_ips_$g" ''); do
             [ "$(printf '%s' "$url" | ipv4s | public_only)" = "$url" ] || die "extra_ips_$g 只允许公网 IPv4"
         done
-    done
-    for g in ps switch; do
-        count=0
+    case "$g" in ps|switch)
         for url in $(cfg "verification_urls_$g" ''); do
             count=$((count+1)); [ "$count" -le 8 ] || die "verification_urls_$g 最多配置 8 条链接"
             platform_url_valid "$g" "$url" || die "$(group_label "$g") 校验链接含未知域名或无效资源路径"
@@ -319,7 +318,13 @@ validate_platform_config() {
                 resource_hash "$url" >/dev/null || die 'Switch 游戏链接校验需要 sha256sum 或 md5sum'
             fi
         done
-    done
+        ;;
+    esac
+}
+
+validate_platform_config() {
+    local g
+    for g in $PLATFORM_GROUPS; do validate_platform_group "$g"; done
 }
 
 # 全部新文件先落盘，提交失败时按组恢复原节点、域名与校验摘要。

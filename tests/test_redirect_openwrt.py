@@ -126,7 +126,7 @@ class RedirectServiceTests(unittest.TestCase):
         main = self.main_pid()
         self.start()
         instances = self.services()['xbox-accel']['instances']
-        self.assertEqual(set(instances), {'resolver', 'redirect'})
+        self.assertEqual(set(instances), {'resolver', 'redirect', 'observation'})
         self.assertTrue(all(value['running'] for value in instances.values()))
         self.assertEqual(instances['redirect']['command'].count('-p'), 2)
         self.assertIn('127.0.0.1:18081', instances['redirect']['command'])

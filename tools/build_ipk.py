@@ -155,7 +155,7 @@ A .ipk cannot be installed by apk. See README.md for limitations.
 '''.encode()
     control = (
         f'Package: {NAME}\nVersion: {target_version}-1\n'
-        'Depends: luci-base, rpcd, curl, ca-bundle, uhttpd, jshn\n'
+        'Depends: luci-base, rpcd, curl, ca-bundle, uhttpd, jshn, conntrack\n'
         'Section: luci\nArchitecture: all\nLicense: MIT\n'
         f'Installed-Size: {sum(len(data) for data in contents.values())}\n'
         'Description: Game download CDN optimization and Xbox HTTP redirect.\n'

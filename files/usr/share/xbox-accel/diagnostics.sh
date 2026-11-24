@@ -30,7 +30,7 @@ T_XBOX_OLD_IP=; T_XBOX_OLD_SPEED=0; T_XBOX_OLD_CANDIDATES=0; T_XBOX_OLD_VALID=0
 T_SWITCH_IP=; T_SWITCH_SPEED=0; T_SWITCH_CANDIDATES=0; T_SWITCH_VALID=0
 TASK_GROUPS='cn com store ps xbox_old switch'
 TASK_HAD_WARNING=0
-LOG_INFO_CODES='TASK_STARTED TASK_FINAL STAGE_SUMMARY NODE_SELECTED ROUTER_VERIFIED DISABLE_VERIFIED'
+LOG_INFO_CODES='TASK_STARTED TASK_FINAL STAGE_SUMMARY NODE_SELECTED MEASUREMENT_READY ROUTER_VERIFIED DISABLE_VERIFIED'
 
 log_event_enabled() {
     [ "${LOG_MODE:-concise}" = detail ] && return 0
@@ -111,6 +111,12 @@ task_event() {
         printf '%s\n' "$line" >>"$LOG_FILE"
     fi
     case "$level" in WARN|ERROR) system_log "$line" ;; esac
+    case "$level:$code" in
+    WARN:*|ERROR:*|INFO:TASK_FINAL|INFO:NODE_SELECTED|INFO:MEASUREMENT_READY|INFO:ROUTER_VERIFIED|INFO:DISABLE_VERIFIED)
+        if command -v record_event >/dev/null 2>&1; then
+            record_event "$level" "$code" "$message" || TASK_PERSIST_WARNING=1
+        fi ;;
+    esac
     return 0
 }
 
@@ -284,6 +290,7 @@ task_snapshot() {
         json_add_int schema 1; json_add_string id "$TASK_ID"
         json_add_string plugin_version "${VERSION:-unknown}"; json_add_string timezone "$(date +%Z)"
         json_add_string kind "$TASK_KIND"; json_add_string trigger "$TASK_TRIGGER"
+        json_add_string intent "${TEST_MODE:-apply}"
         json_add_string status "$TASK_STATUS"; json_add_string stage "$TASK_STAGE"
         json_add_string code "$TASK_CODE"; json_add_string message "$(safe_text "$TASK_MESSAGE")"
         json_add_int queued_at "${TASK_QUEUED:-0}"; json_add_int started_at "$TASK_STARTED"
@@ -292,6 +299,9 @@ task_snapshot() {
         json_add_string finished_text "$( [ "$TASK_FINISHED" -gt 0 ] && date -d "@$TASK_FINISHED" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 未结束 )"
         json_add_int duration_s "$((TASK_FINISHED > 0 && TASK_STARTED > 0 ? TASK_FINISHED - TASK_STARTED : 0))"
         json_add_boolean persistence_warning "$TASK_PERSIST_WARNING"
+        json_add_object progress
+        json_add_int completed "${TASK_PROGRESS_DONE:-0}"; json_add_int total "${TASK_PROGRESS_TOTAL:-0}"
+        json_add_int valid "${TASK_PROGRESS_VALID:-0}"; json_close_object
         json_add_object groups
         for group in $TASK_GROUPS; do add_task_group "$group"; done
         json_close_object
@@ -309,7 +319,7 @@ task_snapshot() {
         json_dump
     ) >"$temporary" && mv "$temporary" "$destination" || { TASK_MEMORY_READY=0; return 1; }
     TASK_MEMORY_READY=1
-    if [ "$TASK_KIND" = test ]; then
+    if [ "$TASK_KIND" = test ] || [ "$TASK_KIND" = measure ]; then
         temporary="$TMP_DIR/last-speed-task.json.new.$$"
         cp "$destination" "$temporary" && mv "$temporary" "$TMP_DIR/last-speed-task.json" || TASK_PERSIST_WARNING=1
     fi
@@ -317,7 +327,7 @@ task_snapshot() {
     if [ "$persist" = 1 ]; then
         temporary="$STATE_DIR/last-task.json.new.$$"
         cp "$destination" "$temporary" && mv "$temporary" "$STATE_DIR/last-task.json" || persist_failed=1
-        if [ "$TASK_KIND" = test ]; then
+        if [ "$TASK_KIND" = test ] || [ "$TASK_KIND" = measure ]; then
             temporary="$STATE_DIR/last-speed-task.json.new.$$"
             cp "$destination" "$temporary" && mv "$temporary" "$STATE_DIR/last-speed-task.json" || persist_failed=1
         fi
@@ -351,6 +361,7 @@ task_begin() {
 
 task_stage() {
     TASK_STAGE=$1
+    TASK_PROGRESS_DONE=0; TASK_PROGRESS_TOTAL=0; TASK_PROGRESS_VALID=0
     task_snapshot 0
 }
 
@@ -384,6 +395,13 @@ task_on_exit() {
         task_event WARN LOG_PERSIST_FAILED '日志快照保存失败；当前日志可在运行日志页查看，建议立即导出'
     fi
     task_snapshot 1 || true
+    if command -v record_task_complete >/dev/null 2>&1; then
+        record_task_complete || {
+            TASK_PERSIST_WARNING=1
+            task_event WARN HISTORY_PERSIST_FAILED '历史记录保存失败，当前任务结果仍可查看'
+            task_snapshot 0 || true
+        }
+    fi
 }
 
 # A queued worker may be cancelled before installing its EXIT trap. Preserve its

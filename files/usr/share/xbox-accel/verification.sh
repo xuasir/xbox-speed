@@ -2,19 +2,30 @@
 # Read-only router verification. No sniffing and no changes to proxy/DNS rules.
 
 check_row() {
-    local name=$1 level=$2 code=$3 detail=$4 hint=${5:-} scope=${6:-router} expected=${7:-} observed=${8:-}
+    local name=$1 level=$2 code=$3 detail=$4 hint=${5:-} scope=${6:-router} expected=${7:-} observed=${8:-} group prefix counter
+    group=${9:-$(verification_row_group "$name")}
     json_add_object ""
     json_add_string name "$name"; json_add_string level "$level"; json_add_string code "$code"
     json_add_string detail "$(safe_text "$detail")"; json_add_string remediation "$hint"
     json_add_string scope "$scope"; json_add_string expected "$expected"; json_add_string observed "$observed"
+    [ -z "$group" ] || json_add_string group "$group"
     json_close_object
     if [ -n "$TASK_ID" ]; then
         local severity=INFO
         [ "$level" = fail ] && severity=ERROR
         case "$level" in unknown|warn) severity=WARN ;; esac
+        case "$code" in TRAFFIC_NOT_OBSERVED|CLIENTS_NOT_OBSERVED|PERFORMANCE_COMPARISON_PENDING|ROUTING_EVIDENCE_PENDING) severity=INFO ;; esac
         task_event "$severity" "$code" "$name: $detail expected=$expected observed=$observed"
     fi
+    if [ -n "$group" ] && { [ "$scope" = router ] || [ "$scope" = measurement ]; }; then
+        prefix=$(task_group_prefix "$group")
+        case "$level" in ok) counter=PASS ;; fail) counter=FAIL ;; warn) [ "$scope" = measurement ] && counter=FAIL || counter=UNKNOWN ;; unknown) counter=UNKNOWN ;; *) counter= ;; esac
+        [ -z "$counter" ] || eval "VG_${prefix}_${counter}=\$((\${VG_${prefix}_${counter}:-0}+1))"
+    fi
     if [ "$scope" = router ]; then
+        if [ -z "$group" ]; then
+            case "$level" in fail) VG_GLOBAL_FAIL=$((VG_GLOBAL_FAIL+1)) ;; warn|unknown) VG_GLOBAL_UNKNOWN=$((VG_GLOBAL_UNKNOWN+1)) ;; esac
+        fi
         case "$level" in
         ok) V_PASS=$((V_PASS+1)) ;;
         fail) V_FAIL=$((V_FAIL+1)) ;;
@@ -27,6 +38,99 @@ check_row() {
     elif [ "$scope" = direct_set ]; then
         case "$level" in ok) D_PASS=$((D_PASS+1)) ;; fail|warn) D_FAIL=$((D_FAIL+1)) ;; unknown) D_UNKNOWN=$((D_UNKNOWN+1)) ;; esac
     fi
+}
+
+# 当前连接的节点命中与分流路径分别验收，设备速度效果保留独立的比较要求。
+verification_observation() {
+    local old="${JSON_PREFIX:-}" enabled available fresh keys key source target groups group status path activity speed detail
+    local matched=0 pending=0 different=0 direct=0 routing_pending=0 intercepted=0
+    OBS_CLIENT_STATUS=unknown; OBS_TRAFFIC_STATUS=unknown
+    json_set_namespace XA_VERIFY_OBSERVATION_
+    if ! json_load "$(observation_document)" 2>/dev/null; then json_init; fi
+    json_get_var enabled enabled; json_get_var available available; json_get_var fresh fresh
+    if [ "$enabled" = 1 ] && [ "$available" = 1 ] && [ "$fresh" = 1 ] && json_select flows; then
+        json_get_keys keys
+        for key in $keys; do
+            json_select "$key"
+            json_get_var source device_ip; json_get_var target target_ip; json_get_var groups groups
+            json_get_var status status; json_get_var path path; json_get_var activity activity; json_get_var speed speed_bps
+            json_select ..
+            [ -n "$groups" ] || continue
+            detail="设备 $source → $target"
+            [ "$activity" != downloading ] || detail="$detail；下行估算 $(fmt_speed "$speed")"
+            json_set_namespace "$old"
+            case "$status" in
+            matched) matched=$((matched+1)); check_row 设备下载节点 ok CLIENT_NODE_MATCHED "$detail；已命中当前节点" '' clients ;;
+            previous) pending=$((pending+1)); check_row 设备下载节点 info CLIENT_PREVIOUS_NODE "$detail；当前连接沿用此前节点" '暂停并继续下载以建立新连接' clients ;;
+            different) different=$((different+1)); check_row 设备下载节点 warn CLIENT_TARGET_DIFFERENT "$detail；实际目标与当前节点存在差异" '检查设备 DNS、IPv6 与分流设置' clients ;;
+            *) pending=$((pending+1)) ;;
+            esac
+            case "$path" in
+            direct) direct=$((direct+1)); check_row 实际连接分流 ok DIRECT_FLOW_OBSERVED "$detail；回复元组、连接标记、规则与路由查询支持直连" '' traffic ;;
+            redirect_entry) routing_pending=$((routing_pending+1)); check_row 实际连接分流 info REDIRECT_ENTRY_OBSERVED "$detail；已进入重定向服务" '继续观察国内节点连接' traffic ;;
+            intercepted) intercepted=$((intercepted+1)); check_row 实际连接分流 warn LOCAL_FORWARD_OBSERVED "$detail；观察到本地转发" '检查代理或转发规则与预期是否一致' traffic ;;
+            *) routing_pending=$((routing_pending+1)); check_row 实际连接分流 unknown ROUTING_EVIDENCE_PENDING "$detail；分流证据待确认" '查看连接标记、规则读取与路由查询结果' traffic ;;
+            esac
+            json_set_namespace XA_VERIFY_OBSERVATION_
+        done
+        json_select ..
+    fi
+    json_set_namespace "$old"
+    if [ "$matched" -gt 0 ]; then
+        OBS_CLIENT_STATUS=verified
+        [ "$pending" -eq 0 ] && [ "$different" -eq 0 ] || OBS_CLIENT_STATUS=partial
+    elif [ "$pending" -gt 0 ] || [ "$different" -gt 0 ]; then OBS_CLIENT_STATUS=partial
+    else check_row 设备下载节点 unknown CLIENTS_NOT_OBSERVED '等待设备下载，节点命中证据会随连接更新' '开始下载后在总览选择设备' clients; fi
+    if [ "$direct" -gt 0 ]; then
+        OBS_TRAFFIC_STATUS=verified
+        [ "$routing_pending" -eq 0 ] && [ "$intercepted" -eq 0 ] || OBS_TRAFFIC_STATUS=partial
+    elif [ "$intercepted" -gt 0 ]; then OBS_TRAFFIC_STATUS=partial
+    else check_row 实际连接分流 unknown TRAFFIC_NOT_OBSERVED '当前分流证据等待设备连接或完整规则信息' '开始下载后查看总览中的分流路径' traffic; fi
+    check_row 下载速度效果 unknown PERFORMANCE_COMPARISON_PENDING '节点命中与下行估算已单独展示，提速幅度需设备使用同一资源对比' '对比应用前后的稳定下载速度' xbox
+}
+
+verification_row_group() {
+    local name=$1 group host
+    case "$name" in
+    '国内优选'|'测试资源 cn'|'节点 cn') echo cn; return ;;
+    '国际处理'|'测试资源 com'|'节点 com'|'HTTP 302'|重定向*) echo com; return ;;
+    esac
+    for group in $ALL_GROUPS; do
+        [ "$name" != "节点 $group" ] || { echo "$group"; return; }
+        for host in $(group_domains "$group"); do
+            case "$name" in *"$host"*) echo "$group"; return ;; esac
+        done
+    done
+    for host in $SRV_NAMES $CDN_HOSTS $COM_DL_DOMAINS; do
+        case "$name" in *"$host"*) echo com; return ;; esac
+    done
+}
+
+verification_groups_summary() {
+    local group prefix passed failed unknown active value
+    active=$(groups_active | tr '\n' ' ')
+    [ "$(com_mode)" != redirect ] || active="$active com"
+    json_add_object groups
+    for group in $ALL_GROUPS; do
+        prefix=$(task_group_prefix "$group")
+        eval "passed=\${VG_${prefix}_PASS:-0}; failed=\${VG_${prefix}_FAIL:-0}; unknown=\${VG_${prefix}_UNKNOWN:-0}"
+        if [ "$group" = com ] && [ "$(com_mode)" = redirect ]; then
+            failed=$((failed+${VG_CN_FAIL:-0})); unknown=$((unknown+${VG_CN_UNKNOWN:-0}))
+        fi
+        value=disabled
+        if is_enabled; then
+            case " $active " in *" $group "*)
+                if [ "$failed" -gt 0 ] || [ "$VG_GLOBAL_FAIL" -gt 0 ]; then value=failed;
+                elif [ "$unknown" -gt 0 ] || [ "$VG_GLOBAL_UNKNOWN" -gt 0 ]; then value=partial;
+                elif [ "$passed" -gt 0 ]; then value=verified;
+                else value=unknown; fi ;;
+            esac
+        fi
+        json_add_object "$group"; json_add_string status "$value"
+        json_add_int passed "$passed"; json_add_int failed "$failed"; json_add_int unknown "$unknown"
+        json_close_object
+    done
+    json_close_object
 }
 
 firewall_snapshot() {
@@ -150,14 +254,14 @@ verify_resource_row() {
         dns_capture a "$host" "$(cfg fallback_dns 223.5.5.5 | awk '{print $1}')" "$directory"
         dns_parse a "$directory"; ip=$(printf '%s\n' "$DNS_VALUES" | ipv4s | public_only | head -n 1)
     fi
-    if [ -z "$ip" ]; then check_row "$title" unknown RESOURCE_DNS_UNKNOWN '没有可用测试地址，资源可用性待确认' '检查上游 DNS 与节点发现结果' measurement; return; fi
+    if [ -z "$ip" ]; then check_row "$title" unknown RESOURCE_DNS_UNKNOWN '没有可用测试地址，资源可用性待确认' '检查上游 DNS 与节点发现结果' measurement '' '' "$g"; return; fi
     got=$(probe_resource "$ip" "$url" "$(domain_offset "$g" "$host")" 1024 3 "$g")
     set -- $got
     classification=$(probe_classify "${4:-0}" "${1:-000}" "$(to_int "$2")" 1024)
     case "$classification" in
-    OK|TIME_LIMIT_WITH_DATA) check_row "$title" ok RESOURCE_AVAILABLE "host=$host ip=$ip HTTP=$1 bytes=$2；该资源可取样，设备实际速度待实机测量" '' measurement ;;
-    HTTP_*|RANGE_INVALID|RANGE_IGNORED|INSUFFICIENT_DATA) check_row "$title" warn "$classification" "host=$host ip=$ip HTTP=$1 bytes=$2；该节点资源校验失败" "$(probe_advice "$classification")" measurement ;;
-    *) check_row "$title" unknown "$classification" "curl_exit=$4 HTTP=$1 bytes=$2 connect_s=${5:-0} total_s=${6:-0} error=$(head -c 250 "$TMP_DIR/probe-error-$$.txt" 2>/dev/null)" "$(probe_advice "$classification")" measurement ;;
+    OK|TIME_LIMIT_WITH_DATA) check_row "$title" ok RESOURCE_AVAILABLE "host=$host ip=$ip HTTP=$1 bytes=$2；该资源可取样，设备实际速度待实机测量" '' measurement '' '' "$g" ;;
+    HTTP_*|RANGE_INVALID|RANGE_IGNORED|INSUFFICIENT_DATA) check_row "$title" warn "$classification" "host=$host ip=$ip HTTP=$1 bytes=$2；该节点资源校验失败" "$(probe_advice "$classification")" measurement '' '' "$g" ;;
+    *) check_row "$title" unknown "$classification" "curl_exit=$4 HTTP=$1 bytes=$2 connect_s=${5:-0} total_s=${6:-0} error=$(head -c 250 "$TMP_DIR/probe-error-$$.txt" 2>/dev/null)" "$(probe_advice "$classification")" measurement '' '' "$g" ;;
     esac
 }
 
@@ -167,6 +271,11 @@ diagnostic_environment() {
     mkdir -p "$work" || return 1
     chmod 700 "$work"
     V_PASS=0; V_FAIL=0; V_WARN=0; V_UNKNOWN=0; V_SKIP=0
+    VG_GLOBAL_FAIL=0; VG_GLOBAL_UNKNOWN=0
+    for g in $ALL_GROUPS; do
+        value=$(task_group_prefix "$g")
+        eval "VG_${value}_PASS=0; VG_${value}_FAIL=0; VG_${value}_UNKNOWN=0"
+    done
     M_PASS=0; M_FAIL=0; M_UNKNOWN=0; D_PASS=0; D_FAIL=0; D_UNKNOWN=0
     is_enabled && enabled=1
     mode=$(com_mode); port=$(cfg resolver_port 5335)
@@ -178,7 +287,7 @@ diagnostic_environment() {
     check_row 系统 info SYSTEM_INFO "$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION $DISTRIB_ARCH")" '' context
     check_row 路由器当前时间 info ROUTER_TIME "$(date '+%Y-%m-%d %H:%M:%S %Z')；使用路由器系统时区" '' context
     missing=""
-    for d in dnsmasq curl flock nslookup uci ubus netstat; do command -v "$d" >/dev/null 2>&1 || missing="$missing $d"; done
+    for d in dnsmasq curl flock nslookup uci ubus netstat conntrack; do command -v "$d" >/dev/null 2>&1 || missing="$missing $d"; done
     if [ -n "$missing" ]; then check_row 依赖 fail DEPENDENCY_MISSING "缺少:$missing" '重新安装必要依赖'; else check_row 依赖 ok DEPENDENCIES_READY '所需命令已安装'; fi
     if value=$( (validate_config) 2>&1); then check_row 配置 ok CONFIG_VALID '配置参数通过校验'; else check_row 配置 fail CONFIG_INVALID "$value" '修正对应配置字段后重新应用'; fi
     value=$(listeners_53)
@@ -291,7 +400,7 @@ diagnostic_environment() {
     [ "$mode" = redirect ] && resources="$resources cn"
     for g in $(echo "$resources" | tr ' ' '\n' | uniq_keep_order); do
         if ! prepare_group_resource "$g"; then
-            check_row "测速链接 $(group_label "$g")" unknown "$GROUP_RESOURCE_CODE" "$GROUP_RESOURCE_MESSAGE" '检查商店链接接口、路由器时钟与自定义资源配置' measurement
+            check_row "测速链接 $(group_label "$g")" unknown "$GROUP_RESOURCE_CODE" "$GROUP_RESOURCE_MESSAGE" '检查商店链接接口、路由器时钟与自定义资源配置' measurement '' '' "$g"
             continue
         fi
         url=$(group_url "$g"); ip=$(best_ip "$g")
@@ -312,7 +421,10 @@ diagnostic_environment() {
     # Check exact configured schedules, not merely that a line has our comment.
     if [ "$enabled" = 1 ]; then
         expected="$(schedule_cron) /usr/bin/xbox-accel start_test all scheduled >/dev/null 2>&1 $CRON_TAG"
-        if ! grep -qxF "$expected" "$CRON_FILE" 2>/dev/null; then check_row 定时完整测速 fail CRON_MISMATCH '实际 cron 条目缺失或与当前配置不同' '重新应用；不要以有任意一条注释作为成功';
+        if [ "$(cfg schedule_type legacy)" = off ]; then
+            if grep -F 'start_test all scheduled' "$CRON_FILE" 2>/dev/null | grep -F "$CRON_TAG" >/dev/null; then check_row 定时完整测速 fail CRON_MISMATCH '仍有插件的定时测速条目' '重新应用以更新自动维护计划';
+            else check_row 定时完整测速 skipped FEATURE_DISABLED '仅手动测速'; fi
+        elif ! grep -qxF "$expected" "$CRON_FILE" 2>/dev/null; then check_row 定时完整测速 fail CRON_MISMATCH '实际 cron 条目缺失或与当前配置不同' '重新应用';
         elif ! pidof crond >/dev/null 2>&1; then check_row 定时完整测速 fail CRON_STOPPED 'cron 进程未运行' '启用 cron 服务';
         else check_row 定时完整测速 ok CRON_CONFIG_VERIFIED "$(schedule_label)；仅验证配置，实际执行历史看任务摘要"; fi
         d=$(to_int "$(cfg health_interval 10)")
@@ -333,7 +445,6 @@ diagnostic_environment() {
             if [ -n "$missing" ]; then check_row Passwall集合 fail DIRECT_SET_MISSING "集合里缺少节点:$missing" '检查写入失败和直连列表是否启用' direct_set;
             else check_row Passwall集合 ok DIRECT_SET_MEMBERSHIP '选中 IP 在集合中；实际流量路径待实机观察' '' direct_set; fi
         fi
-        check_row 实际下载路由 unknown TRAFFIC_NOT_OBSERVED '未抓取或观测 Xbox 实际连接，不能证明流量没有经过代理' '实机观察目标 IP、规则命中及代理流量；集合存在不等于规则被使用' traffic
         ;;
     passwall2) check_row Passwall适配 unknown PASSWALL2_UNSUPPORTED '没有适配 Passwall2 直连集合' '自行核查其分流规则' traffic ;;
     stopped) check_row Passwall skipped SERVICE_STOPPED '已安装但未运行' '' traffic ;;
@@ -344,22 +455,26 @@ diagnostic_environment() {
     if [ "$signature_before" != "$signature_after" ]; then
         check_row 验收配置一致性 unknown CONFIG_CHANGED_DURING_CHECK '验收期间配置或节点发生变化，不能把混合结果视为当前配置成功' '保存配置后重新验收，不要在任务期间修改设置'
     fi
-    check_row Xbox实际效果 unknown XBOX_NOT_OBSERVED '未连接 Xbox 的实际下载观测；路由器检测全通过也不等于提速' '在 Xbox 下载同一游戏，对比前后稳定速度与实际目标节点' xbox
-    check_row 平台设备实际效果 unknown CLIENTS_NOT_OBSERVED '微软商店、PlayStation 与 Switch 的实际下载节点及稳定速度待设备观测' '在对应设备下载同一资源，对比节点与稳定下载速度' clients
+    verification_observation
     json_close_array
+    json_set_namespace XA_VERIFY_OBSERVATION_
+    json_select
+    json_set_namespace ""
+    json_add_object download_observation; json_copy_current XA_VERIFY_OBSERVATION_ "" devices; json_close_object
     json_add_object summary
     if [ "$V_FAIL" -gt 0 ]; then value=failed;
     elif [ "$enabled" = 0 ]; then value=disabled;
     elif [ "$V_UNKNOWN" -gt 0 ] || [ "$V_WARN" -gt 0 ]; then value=partial;
     elif [ -z "$hosts" ]; then value=unknown;
     else value=verified; fi
-    json_add_string router "$value"; json_add_string traffic unknown; json_add_string xbox unknown; json_add_string clients unknown
+    json_add_string router "$value"; json_add_string traffic "$OBS_TRAFFIC_STATUS"; json_add_string xbox unknown; json_add_string clients "$OBS_CLIENT_STATUS"
     if [ "$M_FAIL" -gt 0 ]; then value=failed; elif [ "$M_UNKNOWN" -gt 0 ]; then value=unknown; elif [ "$M_PASS" -gt 0 ]; then value=verified; else value=skipped; fi
     json_add_string measurement "$value"
     if [ "$D_FAIL" -gt 0 ]; then value=failed; elif [ "$D_UNKNOWN" -gt 0 ]; then value=unknown; elif [ "$D_PASS" -gt 0 ]; then value=verified; else value=skipped; fi
     json_add_string direct_set "$value"
     json_add_int passed "$V_PASS"; json_add_int failed "$V_FAIL"; json_add_int warnings "$V_WARN"
     json_add_int unknown "$V_UNKNOWN"; json_add_int skipped "$V_SKIP"
+    verification_groups_summary
     json_close_object
     json_dump
     rm -rf "$work"

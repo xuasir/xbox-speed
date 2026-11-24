@@ -62,7 +62,7 @@ http://dlassets.xboxlive.cn/public/content/0044aef3-bd7e-4478-8782-6191546dcd9a/
 
 启用 Switch 并完成公开测速即可应用默认映射。已有公开主资源验证结果的安装可通过“重新应用”补齐游戏下载域名，沿用现有选中节点。默认映射的验收检查这三个域名的 A 与 AAAA 响应；实际游戏包兼容性和设备下载速度可进一步验证。
 
-“平台下载 → Switch 游戏下载校验链接（可选）”接受完整游戏链接，包括必要的签名参数。填写后，保存并应用会重新测速并增强校验对应域名；资源校验通过后接管，失败时该域名使用上游解析，其余默认映射继续生效。配置列表最多八条，每个域名使用第一条链接。上传测速域名与屏蔽规则由设备和原有网络规则处理。
+“测速 → Switch 测速资源 → 游戏增强校验链接（可选）”接受完整游戏链接，包括必要的签名参数。填写后保存，可单独测速并采用结果；已启用的功能保存应用时会按需要补齐校验。通过校验后接管，失败时该域名使用上游解析，其余默认映射继续生效。配置列表最多八条，每个域名使用第一条链接。上传测速域名与屏蔽规则由设备和原有网络规则处理。
 
 增强校验证据仅保存“域名 + 链接摘要”至 `/etc/xbox-accel/resources_switch`。路径或签名改变后，旧摘要失效，对应域名等待重新校验；删除链接并重新应用后恢复该域名的默认映射。健康检查验证公开主资源和已接管的增强资源。界面分别显示公开测速节点、准备接管的游戏域名数量、默认映射数量与增强校验数量，完整验收将默认映射的 DNS 结果和增强游戏资源验证分别展示。
 
@@ -70,7 +70,7 @@ XboxDownload 同样使用公开资源选优，将 Nintendo 选中节点写入游
 
 ## 配置与命令
 
-“平台下载”页集中提供 Xbox 国内 CDN 优选、国际 CDN 优选、国际下载重定向，以及四个扩展平台的开关、资源覆盖与额外公网 IPv4 候选。每组自动通过 DNS/HTTPDNS 发现节点，并使用独立的 `seeds.<组名>` 参考列表；节点仍由当前线路实测排名。
+“加速功能”提供平台开关与国际下载方式，“测速”提供单项、多选测速及折叠的资源设置。平台关闭时仍可独立测速，结果保存为候选，采用后开启对应功能并应用。每组通过 DNS/HTTPDNS 发现节点，自动选优使用独立的 `seeds.<组名>` 参考列表；节点由当前线路实测排名。
 
 ```sh
 uci set xbox-accel.main.optimize_store='1'
@@ -80,10 +80,12 @@ uci set xbox-accel.main.optimize_xbox_old='1'
 uci set xbox-accel.main.optimize_switch='1'
 uci commit xbox-accel
 
-xbox-accel start_test store
-xbox-accel start_test ps
-xbox-accel start_test xbox_old
-xbox-accel start_test switch
+xbox-accel start_measure store
+xbox-accel start_measure ps
+xbox-accel start_measure xbox_old
+xbox-accel start_measure switch
+# 查看候选后采用，结果 ID 来自 xbox-accel json_status 的 measurements
+xbox-accel start_adopt ps 结果ID
 ```
 
 可选资源配置字段为 `test_url_<组名>`，额外节点为 `list extra_ips_<组名>`。测速起始偏移由 `test_offset_<组名>` 指定；PS 与 Switch 的其他独立资源从零偏移开始验证。URL 接受已知平台域名的 HTTP/HTTPS 默认端口，保留完整资源路径；IPv4 候选使用公网地址。

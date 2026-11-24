@@ -5,7 +5,8 @@
 			"ubus": {
 				"xbox-accel": [
 					"status",
-					"environment"
+					"environment",
+					"records"
 				]
 			},
 			"uci": [

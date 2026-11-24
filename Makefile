@@ -13,7 +13,7 @@ define Package/luci-app-xbox-accel
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Game download CDN optimization and Xbox HTTP redirect
-  DEPENDS:=+luci-base +rpcd +curl +ca-bundle +uhttpd +jshn
+  DEPENDS:=+luci-base +rpcd +curl +ca-bundle +uhttpd +jshn +conntrack
 endef
 
 define Package/luci-app-xbox-accel/description

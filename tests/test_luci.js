@@ -1,253 +1,278 @@
 'use strict';
-// 用最小的 LuCI 替身加载视图，检查渲染、按钮状态、日志按纯文本显示，以及“保存并应用”的时序。
-// 不能代替在真实 LuCI 里的验证。
+// LuCI 替身覆盖用户操作、任务状态、保存时序和下载证据的显示边界。
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-
-const source = fs.readFileSync(path.join(__dirname, '../files/www/luci-static/resources/view/xbox-accel/overview.js'), 'utf8');
-const calls = [];
-const listeners = new Map();
-const options = [];
-const tabs = [];
-const downloads = [];
-const fileApi = { read_direct(file) { downloads.push(file); return Promise.resolve({text:()=>Promise.resolve('{}')}); } };
-const urlApi = {createObjectURL:()=> 'blob:diagnostics', revokeObjectURL() {}};
-
-String.prototype.format = function(...args) {
-	let i = 0;
-	return this.replace(/%[sd]/g, () => String(args[i++]));
-};
-
-const status = {
-	version: '0.2.0', enabled: true, running: true, testing: false, mode: 'redirect', optimize_cn: true,
-	lan_ip: '192.168.1.1', cn_ip: '1.2.3.4', cn_speed: '10.00 MB/s（80 Mbps）', cn_time: 1700000000,
-	redirect_ip: '192.0.2.1', redirect_port: '18081', redirect_running: true,
-	com_ip: '', log: '<script>alert(1)</script>'
-};
-const environment = { environment: [ { name: '解析', level: 'fail', detail: '<b>x</b>' }, { name: '系统', level: 'info', detail: 'OpenWrt' } ] };
-
-function E(tag, attrs, children) {
-	return { tag, attrs: attrs || {}, children: children || [], value: '', textContent: '', disabled: false,
-		scrollTop: 0, clientHeight: 0, scrollHeight: 0 };
+const source = fs.readFileSync(path.join(__dirname,'../files/www/luci-static/resources/view/xbox-accel/overview.js'),'utf8');
+const calls=[],options=[],tabs=[],downloads=[],listeners=new Map(),changes=[];
+const config={cron:'0 1 * * 1',health_interval:'40',optimize_cn:'1',optimize_com:'1',redirect_cn:'0',enabled:'1'};
+const status={version:'0.3.0',enabled:true,running:true,testing:false,mode:'optimize',optimize_cn:true,
+	cn_ip:'8.8.4.4',com_ip:'1.1.1.1',log:'<script>alert(1)</script>',platforms:{ps:{enabled:false},switch:{enabled:false}}};
+const environment={environment:[{name:'解析',level:'fail',detail:'<b>x</b>'}]};
+let actionReply={ok:true};
+let records={events:[],errors:[],tasks:[]};
+String.prototype.format=function(...args){let i=0;return this.replace(/%[sd]/g,()=>String(args[i++]));};
+function E(tag,attrs,children){
+	return {tag,attrs:attrs||{},children:children||[],value:attrs?.value||'',textContent:'',disabled:false,checked:false,
+		scrollTop:0,clientHeight:0,scrollHeight:0};
 }
-
-class MapMock {
-	section() {
-		return {
-			tab(name, label) { tabs.push({name, label}); },
-		taboption(tab, type, name, title, description) { const o = { tab, type, name, title, description, choices: [], depends() {}, value(key,label) { this.choices.push([key,label]); } }; options.push(o); return o; }
-		};
-	}
-	render() { return Promise.resolve(E('form', {}, options.filter(o => o.render).map(o => o.render()))); }
+function text(node){
+	if(node==null)return '';
+	if(typeof node==='string'||typeof node==='number')return String(node);
+	return (node.textContent||'')+(node.children||[]).map(text).join(' ');
 }
-
-const view = {
-	extend(def) {
-		def.super = function(name) {
-			calls.push([ 'super', name ]);
-			return Promise.resolve();
-		};
-		return def;
+function find(node,id){
+	if(!node||typeof node!=='object')return null;
+	if(node.attrs&&node.attrs.id===id)return node;
+	for(const child of [].concat(node.children||[])){const hit=find(child,id);if(hit)return hit;}
+	return null;
+}
+function section(tab){
+	const s={children:[],
+		tab(name,label){tabs.push({name,label});},
+		taboption(tab,type,name,...args){return addOption(this,tab,type,name,args);},
+		option(type,name,...args){return addOption(this,tab,type,name,args);}
+	};
+	return s;
+}
+function addOption(parent,tab,type,name,args){
+	const o={tab,type,name,option:name,title:args[0],description:args[1],choices:[],dependencies:[],
+		depends(...args){this.dependencies.push(args);},value(key,label){this.choices.push([key,label]);},
+		cfgvalue(id,value){if(arguments.length===2)this.cachedValue=value;return Object.prototype.hasOwnProperty.call(this,'cachedValue')?this.cachedValue:config[name]??this.default;},getUIElement(){return{setValue(value){changes.push([name,value]);}}}
+	};
+	if(type===form.SectionValue){
+		o.subsection=section(tab);
+		o.renderWidget=async function(){return E('div',{},await Promise.all(o.subsection.children.map(renderOption)));};
 	}
-};
-const rpc = {
-	declare(spec) {
-		return (...args) => {
-			calls.push([ spec.method, ...args ]);
-			if (spec.method == 'status') return Promise.resolve(status);
-			if (spec.method == 'environment') return Promise.resolve(environment);
-			return Promise.resolve({ ok: true, message: '' });
-		};
+	parent.children.push(o);options.push(o);return o;
+}
+async function renderOption(o){
+	if(o.render)return o.render();
+	if(o.renderWidget)return o.renderWidget('main');
+	return E('div',{'data-name':o.name},[o.title||'']);
+}
+class MapMock{
+	section(){this.s=section();return this.s;}
+	render(){
+		if(faults.render>0){faults.render--;return Promise.reject(interrupted());}
+		return Promise.all(this.s.children.map(renderOption)).then(nodes=>E('form',{},nodes));
 	}
-};
-const ui = {
-	createHandlerFn(ctx, fn) { return () => (typeof fn == 'string' ? ctx[fn]() : fn.call(ctx)); },
-	addNotification() { calls.push([ 'notify' ]); }
-};
-const dom = { content(node, children) { node.children = children; } };
-const document = {
-	createElement() { return {click(){calls.push(['download']);}}; },
-	addEventListener(name, fn) { listeners.set(name, fn); },
-	removeEventListener(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); }
-};
-const L = { resolveDefault: p => Promise.resolve(p), bind: (fn, ctx) => fn.bind(ctx) };
-const form = { Map: MapMock, NamedSection: 1, Flag: 2, Value: 3, ListValue: 4, DynamicList: 5 };
+}
+const view={extend(def){def.super=function(name){calls.push(['super',name]);return Promise.resolve();};return def;}};
+// 故障注入：模拟浏览器在取得响应前中断请求（LuCI 报 XHR request aborted by browser）。
+const faults={uci:0,status:0,render:0,error:null};
+const interrupted=()=>faults.error||new Error('XHR request aborted by browser');
+const rpc={declare(spec){return(...args)=>{
+	calls.push([spec.method,...args]);
+	if(spec.method==='status'&&faults.status>0){faults.status--;return Promise.reject(interrupted());}
+	return Promise.resolve(spec.method==='status'?status:spec.method==='environment'?environment:spec.method==='records'?records:actionReply);
+};}};
+const ui={createHandlerFn(ctx,fn){return()=>typeof fn==='string'?ctx[fn]():fn.call(ctx);},addNotification(a,b,type){calls.push(['notify',text(b),type]);}};
+const viewNode=E('div',{id:'view'});
+const dom={content(node,children){node.children=children;},append(node,child){node.children=[].concat(node.children||[],[child]);}};
+const document={createElement(){return{click(){calls.push(['download']);}};},getElementById(id){return id==='view'?viewNode:null;},
+	addEventListener(name,fn){listeners.set(name,fn);},removeEventListener(name,fn){if(listeners.get(name)===fn)listeners.delete(name);}};
+// 与 LuCI 一致：失败的读取结果留在缓存中，unload 之后才会重新请求。
+const uci={cached:null,load(){if(this.cached)return this.cached;if(faults.uci>0){faults.uci--;return this.cached=Promise.reject(interrupted());}return Promise.resolve();},unload(){this.cached=null;},get(c,s,key){return config[key];},set(c,s,key,value){config[key]=value;changes.push([key,value]);}};
+const fileApi={read_direct(file){downloads.push(file);return Promise.resolve({text:()=>Promise.resolve('{}')});}};
+const urlApi={createObjectURL:()=> 'blob:diagnostics',revokeObjectURL(){}};
+const L={bind:(fn,ctx)=>fn.bind(ctx)};
+const form={Map:MapMock,NamedSection:1,Flag:2,Value:3,ListValue:4,DynamicList:5,DummyValue:6,SectionValue:7};
 let pollStatus;
-const poll = { add(fn, interval) { pollStatus = fn; assert.strictEqual(interval, 5); } };
-const uci = { load() { return Promise.resolve(); }, get(config,section,key) { return {cron:'0 1 * * 1', health_interval:'40'}[key]; } };
-const window = { confirm: () => true };
+const poll={add(fn,interval){pollStatus=fn;assert.strictEqual(interval,5);}};
+const body=source.replace(/^'require [^']+';$/gm,'');
+const v=new Function('view','form','uci','rpc','poll','ui','dom','E','L','document','window','fs','URL',body)(
+	view,form,uci,rpc,poll,ui,dom,E,L,document,{confirm:()=>true},fileApi,urlApi);
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
-const body = source.replace(/^'require [^']+';$/gm, '');
-const v = new Function('view', 'form', 'uci', 'rpc', 'poll', 'ui', 'dom', 'E', 'L', 'document', 'window', 'fs', 'URL', body)(
-	view, form, uci, rpc, poll, ui, dom, E, L, document, window, fileApi, urlApi);
+(async()=>{
+	const page=await v.render(await v.load());
+	assert.deepStrictEqual(tabs.map(t=>t.label),['总览','加速功能','测速','运行记录']);
+	assert.strictEqual(page.attrs.class,'xa-product');
+	for(const id of ['_automatic','_compatibility','_sampling','_resource_switch','xbox-accel-diagnostics','xbox-accel-raw-log'])
+		assert(!v.disclosures[id].open,'高级内容默认折叠：'+id);
+	assert.strictEqual(options.find(o=>o.name==='_records').tab,'records');
+	assert.strictEqual(v.logNode.value,status.log);
+	assert(!text(v.statusNode).includes('TASK_'),'首页摘要只展示用户可读结论');
+	assert(!v.buttons.test.disabled && v.buttons.cancel.disabled);
+	assert(v.buttons.adopt_ps.disabled,'取得结果后才可采用');
 
-(async () => {
-	const data = await v.load();
-	const page = await v.render(data);
-	assert.strictEqual(page.children.length, 2, '顶部状态之外只能有一个统一标签表单');
-	assert.deepStrictEqual(tabs.map(t => t.name), ['basic', 'platforms', 'test', 'advanced', 'environment', 'logs']);
-	assert(options.find(o => o.name === '_environment').tab === 'environment');
-	assert(options.find(o => o.name === '_logs').tab === 'logs');
-	assert.strictEqual(v.buttons.cancel.disabled, true, '空闲时停止按钮应禁用');
-	assert.strictEqual(v.buttons.restart.children[0], '重启服务');
-	assert.strictEqual(v.buttons.restart.disabled, false);
-	calls.length = 0;
-	await v.buttons.restart.attrs.click();
-	assert(calls.some(c => c[0] === 'action' && c[1] === 'restart'));
+	// 关闭的平台和关闭的总服务仍可单独测，手动动作携带明确的选择。
+	v.updateStatus({...status,enabled:false,platforms:{ps:{enabled:false},switch:{enabled:false}}});
+	calls.length=0;changes.length=0;
+	await v.buttons.test_ps.attrs.click();
+	assert(calls.some(c=>c[0]==='action'&&c[1]==='test_ps'));
+	assert.strictEqual(changes.length,0);
+	v.selectGroups(['ps','switch']);
+	await v.buttons.test.attrs.click();
+	assert(calls.some(c=>c[0]==='action'&&c[1]==='test'&&c[2]==='ps,switch'));
+	v.selectGroups([]);calls.length=0;await v.buttons.test.attrs.click();
+	assert(!calls.some(c=>c[0]==='action'));
+	assert(calls.some(c=>c[0]==='notify'&&c[1].includes('请选择')));
 
-	// 日志进入 textarea 的 value，不会被当作 HTML 解析
-	assert.strictEqual(v.logNode.value, status.log);
-	// 环境检测的内容作为文本节点传入
-	assert.strictEqual(v.envNode.children[0].children[2].children[0], '<b>x</b>');
-	assert.strictEqual(v.envNode.children[0].children[1].children[0], '失败');
+	const result={id:'20261124T080000-12',ip:'9.9.9.9',speed_bps:20000000,tested_at:1700000000,compatible:true};
+	v.updateStatus({...status,enabled:false,measurements:{ps:result}});
+	assert(text(v.resultRows.ps.result).includes('9.9.9.9'));
+	assert(text(v.resultRows.ps.adopt).includes('启用并应用'));
+	assert(!v.buttons.adopt_ps.disabled);
+	calls.length=0;await v.buttons.adopt_ps.attrs.click();
+	assert(calls.some(c=>c[0]==='action'&&c[1]==='adopt_ps'&&c[3]===result.id));
+	config.enabled='1';config.optimize_ps='1';
+	v.configOptions.enabled.cfgvalue('main','0');v.configOptions.optimize_ps.cfgvalue('main','0');
+	await v.refreshAdoptedConfiguration();
+	assert.strictEqual(v.configOptions.enabled.cfgvalue('main'),'1');
+	assert.strictEqual(v.configOptions.optimize_ps.cfgvalue('main'),'1');
+	assert(changes.some(c=>c[0]==='enabled'&&c[1]==='1'));
+	v.updateStatus({...status,measurements:{ps:{...result,compatible:false}}});
+	assert(v.buttons.adopt_ps.disabled);
+	assert(text(v.resultRows.ps.result).includes('重新测速'));
 
-	// 按入口折叠成功域名，异常组展开，刷新时保留手动选择。
-	const dnsReport = { environment: [
-		{ name: '依赖', level: 'ok', detail: '就绪' },
-		{ name: 'A assets1.xboxlive.cn @127.0.0.1:5335', level: 'ok', expected: '9.9.9.9', observed: '9.9.9.9' },
-		{ name: 'AAAA assets1.xboxlive.cn @127.0.0.1:5335', level: 'ok', expected: 'NODATA', observed: 'NODATA' },
-		{ name: 'SRV assets-srvs.xboxlive.com @127.0.0.1:53', level: 'fail', detail: '<b>异常</b>' },
-		{ name: 'DNS 验收 @127.0.0.1:1053', level: 'unknown', detail: '超时' },
-		{ name: '覆盖 dlassets.xboxlive.com', level: 'skipped', detail: '默认解析' }
-	] };
-	v.updateEnvironment(dnsReport);
-	const dnsGroups = () => v.envNode.children.slice(1).map(row => row.children[0].children[0]);
-	let groups = dnsGroups();
-	assert.strictEqual(groups.length, 4);
-	assert.strictEqual(groups[0].open, false);
-	assert(groups[0].children[0].children[0].includes('独立解析实例（127.0.0.1:5335）：2 项；正常 2'));
-	assert.strictEqual(groups[1].open, true);
-	assert.strictEqual(groups[2].open, true);
-	assert.strictEqual(groups[3].open, false);
-	assert.strictEqual(groups[1].children[1].children[0].children[2].children[0], '<b>异常</b>');
-	groups[0].attrs.toggle({target:{open:true}});
-	groups[1].attrs.toggle({target:{open:false}});
-	v.updateEnvironment(dnsReport);
-	groups = dnsGroups();
-	assert.strictEqual(groups[0].open, true, '已手动展开的成功组应保留');
-	assert.strictEqual(groups[1].open, false, '已手动折叠的异常组应保留');
-	groups[0].attrs.toggle({target:{open:false}});
-	v.updateEnvironment({environment:dnsReport.environment.map((row,i) => i === 1 ? {...row,level:'fail'} : row)});
-	assert.strictEqual(dnsGroups()[0].open, true, '新出现异常的入口应自动展开');
-	v.updateEnvironment(environment);
+	// 排队与运行阶段互斥，取消保留可用；保存配置等待任务完成。
+	v.updateStatus({...status,last_task:{id:'q1',kind:'measure',status:'queued',stage:'queued'}});
+	assert(v.buttons.test.disabled && v.buttons.restart.disabled && v.buttons.adopt_ps.disabled);
+	assert(!v.buttons.cancel.disabled);
+	calls.length=0;await v.handleSaveApply({},'0');
+	assert(!calls.some(c=>c[0]==='super'));
+	v.updateStatus({...status,last_task:{id:'q1',kind:'measure',status:'running',stage:'quick_ps',progress:{completed:2,total:5,valid:1}}});
+	assert(text(v.progressNode).includes('PlayStation · 初筛'));
+	assert(text(v.progressNode).includes('2/5'));
 
-	// 稳定状态降低 RPC 频率，异常和后台任务恢复快速刷新。
-	calls.length = 0;
-	v.updateStatus(status);
-	assert(v.nextStatusPoll > Date.now() + 29000);
-	await pollStatus();
-	assert(!calls.some(c => c[0] === 'status'));
-	v.nextStatusPoll = 0;
-	await pollStatus();
-	assert.strictEqual(calls.filter(c => c[0] === 'status').length, 1);
-	v.updateStatus({...status,testing:true});
-	assert(v.nextStatusPoll < Date.now() + 6000);
-	v.updateStatus({...status,running:false});
-	assert(v.nextStatusPoll < Date.now() + 6000);
+	// 状态失败保留已有日志并暂停修改，恢复后重新启用动作。
 	v.updateStatus({status_error:'RPC unavailable'});
-	assert(v.nextStatusPoll < Date.now() + 6000);
+	assert(text(v.statusNode).includes('状态读取失败'));
+	assert.strictEqual(v.logNode.value,status.log);
+	assert(v.buttons.test.disabled);
 	v.updateStatus(status);
+	assert(!v.buttons.test.disabled);
 
-	// 未知与部分成功不能被显示成关闭或全部通过。
-	v.updateStatus({...status,last_test:{id:'t1',kind:'test',status:'partial',code:'PARTIAL_RESULT',stage:'finished',message:'国内失败',groups:{cn:{status:'failed',code:'FULL_TEST_FAILED',message:'复测失败'},com:{status:'success',code:'SELECTED',message:'采样通过'}},application:{status:'failed',code:'DNS_MISMATCH'}}});
-	const summary=v.statusNode.children.find(row=>row.children[0].children[0]==='最近完整测速').children[1].children[0];
-	assert(summary.includes('部分完成'));
-	const detailed=v.taskDetails.children[1].children[0];
-	assert(detailed.includes('FULL_TEST_FAILED') && detailed.includes('DNS_MISMATCH'));
-	v.updateStatus({status_error:'RPC unavailable'});
-	assert(v.statusNode.children[0].children[1].children[0].includes('无法取得状态'));
-	assert(v.statusNode.children[1].children[1].children[0].includes('未知'));
-	assert.strictEqual(v.logNode.value,status.log,'状态失败不得抹去已有日志');
-	v.updateStatus(status);
-	v.pendingExport='export-queued';
-	calls.length=0;
-	v.updateStatus({...status,report_ready:true,last_task:{id:'export-queued',kind:'report',status:'queued',code:'ACCEPTED'}});
-	assert.strictEqual(v.pendingExport,'export-queued','受理中的导出应等待最终结果');
-	assert(v.buttons.export.disabled && v.buttons.test.disabled && v.buttons.restart.disabled && !v.buttons.cancel.disabled,'任务排队时按钮应保持运行状态');
-	assert(!calls.some(c=>c[0]==='notify'),'排队阶段应保留任务，等待最终结果');
-	v.updateStatus({...status,report_ready:true,last_task:{id:'export-queued',kind:'report',status:'success',code:'REPORT_READY'}});
-	await new Promise(resolve=>setImmediate(resolve));
-	assert.strictEqual(v.pendingExport,null);
-	assert.deepStrictEqual(downloads,['/tmp/xbox-accel/diagnostic-report.json']);
-	assert(calls.some(c=>c[0]==='download'));
-	v.updateStatus({...status,log_source:'persisted'});
-	assert(v.logNote.textContent.includes('历史日志快照'));
-	const oldAvailable={...status,last_application:{available:true,checked_at:1,status:'verified'}};
-	v.updateStatus(oldAvailable);
-	downloads.length=0;
-	await v.refreshEnvironment();
-	assert.strictEqual(downloads.length,0,'快速初查应展示当前结果，历史验收由单独按钮读取');
+	// 设备节点命中与分流证据分别显示；共享目标和旧连接保持准确措辞。
+	const devices=[{ip:'192.168.1.20',name:'Xbox'},{ip:'192.168.1.21',name:'<script>device</script>'}];
+	const flow={device_ip:'192.168.1.20',target_ip:'8.8.4.4',target_port:443,groups:'cn',status:'matched',path:'unknown',
+		speed_bps:12300000,observed_at:1700000000,activity:'downloading'};
+	const observation={fresh:true,available:true,observed_at:1700000000,devices,flows:[flow,{...flow,device_ip:'192.168.1.21',target_ip:'1.1.1.1',groups:'com',path:'direct'}]};
+	v.updateStatus({...status,observation});
+	assert(text(v.downloadNode).includes('已命中当前节点')&&text(v.downloadNode).includes('分流路径待确认'));
+	assert(text(v.downloadNode).includes('12.30 MB/s（估算）'));
+	v.selectedDevice='192.168.1.20';v.updateDownloads({...status,observation});
+	assert(!text(v.downloadNode).includes('1.1.1.1:443'));
+	assert(!text(v.downloadNode).includes('直连已确认'));
+	v.updateStatus({...status,observation:{...observation,flows:[{...flow,status:'previous',shared_node:true}]}});
+	assert(text(v.featureNode).includes('连接沿用旧节点'));
+	assert(!text(v.featureNode).includes('共享节点命中'));
+	assert(text(v.downloadNode).includes('暂停并继续'));
+	v.updateStatus({...status,observation:{...observation,fresh:false}});
+	assert(!text(v.downloadNode).includes('已命中当前节点'));
+	v.selectedDevice='';
+	v.updateStatus({...status,last_application:{status:'verified',router:'verified',same_configuration:false,checked_at:1700000000}});
+	assert(text(v.statusNode).includes('配置已变化'));
+	assert(text(v.featureNode).includes('等待检查'));
 
-	// 每个配置项都有对应的界面选项
-	const names = options.map(o => o.name);
-	for (const n of [ 'enabled', 'autostart', 'optimize_cn', 'optimize_com', 'redirect_cn', 'isp', 'schedule_type', 'schedule_time', 'schedule_weekday', 'schedule_monthday', 'health_interval',
-		'switch_threshold', 'max_candidates', 'quick_size_mb', 'quick_time', 'top_n', 'full_size_mb', 'full_time',
-		'override_cdn_hosts', 'passwall_direct', 'passwall_restart', 'dnsmasq_instance', 'resolver_port', 'redirect_ip', 'redirect_port', 'ttl', 'fallback_dns', 'log_mode' ])
-		assert(names.includes(n), 'missing option ' + n);
-	for (const group of ['store','ps','xbox_old','switch']) {
-		assert.strictEqual(options.find(o=>o.name==='optimize_'+group).default, '0');
-		assert(names.includes('test_url_'+group) && names.includes('extra_ips_'+group));
+	// 日常、异常、完整任务各自可查看，错误内容以文本展示。
+	records={source:'persisted',events:[{time:1700000000,level:'INFO',code:'DOWNLOAD_MATCHED',message:'192.168.1.20 → 8.8.4.4'}],
+		errors:[{time:1700000000,level:'ERROR',kind:'measure',code:'FULL_TEST_FAILED',message:'<b>失败</b>'}],
+		tasks:[{id:'old1',kind:'measure',status:'partial',code:'PARTIAL_RESULT',message:'部分平台失败',groups:{ps:{status:'failed',code:'FULL_TEST_FAILED',message:'复测失败'}}}]};
+	await v.loadRecords();
+	assert(text(v.eventsNode).includes('历史事件')&&text(v.eventsNode).includes('设备连接命中'));
+	assert(text(v.taskDetails).includes('FULL_TEST_FAILED'));
+	v.recordFilter.value='errors';v.updateRecords(records);
+	assert(text(v.eventsNode).includes('<b>失败</b>'));
+	assert(!text(v.eventsNode).includes('DOWNLOAD_MATCHED'));
+
+	// DNS 报告按入口折叠，刷新保留手动展开状态。
+	const report={environment:[
+		{name:'依赖',level:'ok',detail:'就绪'},
+		{name:'A assets1.xboxlive.cn @127.0.0.1:5335',level:'ok',expected:'9.9.9.9',observed:'9.9.9.9'},
+		{name:'SRV assets-srvs.xboxlive.com @127.0.0.1:53',level:'fail',detail:'<b>异常</b>'}
+	]};
+	v.updateEnvironment(report);
+	let dns=v.envNode.children.slice(1).map(row=>row.children[0].children[0]);
+	assert(!dns[0].open&&dns[1].open);
+	dns[0].attrs.toggle({target:{open:true}});v.updateEnvironment(report);
+	assert(v.envNode.children[1].children[0].children[0].open);
+	assert(text(v.envNode).includes('<b>异常</b>'));
+
+	// 国际策略互斥并联动国内优选；测试资源对关闭平台保持可编辑。
+	const mode=options.find(o=>o.name==='_international_mode');
+	assert.deepStrictEqual(mode.choices.map(c=>c[0]),['off','optimize','redirect']);
+	mode.write('main','redirect');
+	assert.strictEqual(config.redirect_cn,'1');assert.strictEqual(config.optimize_com,'0');assert.strictEqual(config.optimize_cn,'1');
+	mode.write('main','optimize');assert.strictEqual(config.redirect_cn,'0');assert.strictEqual(config.optimize_com,'1');
+	for(const group of ['cn','com','store','ps','xbox_old','switch']){
+		const resource=options.find(o=>o.name==='test_url_'+group);
+		assert(resource&&resource.tab==='test');
+		assert(!resource.dependencies.some(d=>d[0]==='optimize_'+group));
 		assert(v.buttons['test_'+group]);
 	}
-	assert(names.includes('store_test_app') && names.includes('verification_urls_switch') && names.includes('verification_urls_ps'));
-	const switchLink = options.find(o=>o.name==='verification_urls_switch');
-	assert(switchLink.optional && switchLink.title.includes('可选') && switchLink.description.includes('默认节点映射'));
-	assert.strictEqual(switchLink.validate('main',''), true);
-	assert.strictEqual(switchLink.validate('main','https://atum.hac.lp1.d4c.nintendo.net/game?token=value'), true);
-	for (const url of ['https://evil.example/game','https://ctest-dl-lp1.cdn.nintendo.net/30m','https://atum.hac.lp1.d4c.nintendo.net:8443/game','https://user@atum.hac.lp1.d4c.nintendo.net/game'])
-		assert.notStrictEqual(switchLink.validate('main',url), true);
-	v.updateStatus({...status,platforms:{switch:{enabled:true,ip:'9.9.9.9',game_status:'default',game_configured:0,game_verified:0,game_mapped:3,game_default_mapped:3,game_total:3}},last_test:{kind:'test',status:'partial',groups:{store:{status:'failed',code:'STORE_LINK_FETCH_FAILED',message:'链接获取失败'},switch:{status:'success',code:'SELECTED',message:'公开测速通过'}}}});
-	const switchText = () => v.statusNode.children.find(row=>row.children[0].children[0]==='Switch').children[1].children[0];
-	assert(switchText().includes('已准备 3/3（默认映射 3）') && switchText().includes('增强校验：可选'));
-	assert(v.taskDetails.children[1].children[0].includes('STORE_LINK_FETCH_FAILED'));
-	v.updateStatus({...status,platforms:{switch:{enabled:true,ip:'9.9.9.9',game_status:'pending',game_configured:1,game_verified:0,game_mapped:2,game_default_mapped:2,game_total:3}}});
-	assert(switchText().includes('已准备 2/3（默认映射 2）') && switchText().includes('增强校验：0/1'));
-	v.updateStatus({...status,platforms:{switch:{enabled:true,ip:'9.9.9.9',game_status:'verified',game_configured:1,game_verified:1,game_mapped:3,game_default_mapped:2,game_total:3}}});
-	assert(switchText().includes('已准备 3/3（默认映射 2）') && switchText().includes('增强校验：1/1'));
-	v.updateStatus(status);
+	const switchLink=options.find(o=>o.name==='verification_urls_switch');
+	assert.strictEqual(switchLink.validate('main',''),true);
+	assert.strictEqual(switchLink.validate('main','https://atum.hac.lp1.d4c.nintendo.net/game?token=value'),true);
+	for(const url of ['https://evil.example/game','https://ctest-dl-lp1.cdn.nintendo.net/30m','https://user@atum.hac.lp1.d4c.nintendo.net/game'])
+		assert.notStrictEqual(switchLink.validate('main',url),true);
+	const frequency=options.find(o=>o.name==='schedule_type');
+	assert.deepStrictEqual(frequency.choices.map(c=>c[0]),['off','daily','weekly','monthly']);
+	assert.strictEqual(frequency.cfgvalue('main'),'weekly');
+	const scheduleTime=options.find(o=>o.name==='schedule_time');
+	assert.strictEqual(scheduleTime.cfgvalue('main'),'01:00');
+	for(const value of ['00:00','23:59'])assert.strictEqual(scheduleTime.validate('main',value),true);
+	for(const value of ['24:00','5:15','12:60'])assert.notStrictEqual(scheduleTime.validate('main',value),true);
+	assert(options.find(o=>o.name==='health_interval').choices.some(c=>c[0]==='40'&&c[1].includes('00、40')));
+	assert.strictEqual(options.find(o=>o.name==='log_mode').tab,'records');
 
-	// 日/周/月 + 时间，不枚举时间预设；旧简单周计划自动映射。
-	assert(!options.some(o => o.name === 'cron'));
-	const frequency = options.find(o => o.name === 'schedule_type');
-	assert.strictEqual(frequency.type, form.ListValue);
-	assert.deepStrictEqual(frequency.choices.map(c => c[0]), ['daily', 'weekly', 'monthly']);
-	assert.strictEqual(frequency.cfgvalue('main'), 'weekly');
-	const scheduleTime = options.find(o => o.name === 'schedule_time');
-	assert.strictEqual(scheduleTime.cfgvalue('main'), '01:00');
-	assert.strictEqual(options.find(o => o.name === 'schedule_weekday').cfgvalue('main'), '1');
-	for (const value of ['00:00', '05:15', '23:59']) assert.strictEqual(scheduleTime.validate('main', value), true);
-	for (const value of ['24:00', '12:60', '5:15', '12:00 ; reboot', '']) assert.notStrictEqual(scheduleTime.validate('main', value), true);
-	const monthday = options.find(o => o.name === 'schedule_monthday');
-	for (const value of ['1', '29', '31']) assert.strictEqual(monthday.validate('main', value), true);
-	for (const value of ['0', '32', '1.5', '1; reboot']) assert.notStrictEqual(monthday.validate('main', value), true);
-	const health = options.find(o=>o.name==='health_interval');
-	assert.strictEqual(health.type, form.ListValue);
-	assert(health.choices.some(c=>c[0]==='40' && c[1].includes('00、40')));
-	const logMode = options.find(o => o.name === 'log_mode');
-	assert.strictEqual(logMode.tab, 'logs');
-	assert.strictEqual(logMode.default, 'concise');
-	assert.deepStrictEqual(logMode.choices.map(c => c[0]), ['concise', 'detail']);
+	// 首页在运行时快速发现新下载，其他稳定页减少轮询。
+	v.updateStatus(status);assert(v.nextStatusPoll<Date.now()+6000);
+	v.activeTab='functions';v.updateStatus(status);assert(v.nextStatusPoll>Date.now()+29000);
+	calls.length=0;await pollStatus();assert(!calls.some(c=>c[0]==='status'));
+	v.nextStatusPoll=0;await pollStatus();assert(calls.some(c=>c[0]==='status'));
 
-	// 测速期间禁用测速按钮，只允许停止
-	v.updateStatus(Object.assign({}, status, { testing: true }));
-	assert(v.buttons.test.disabled && v.buttons.test_cn.disabled && v.buttons.test_com.disabled && v.buttons.restart.disabled);
-	for (const group of ['store','ps','xbox_old','switch']) assert(v.buttons['test_'+group].disabled);
-	assert(!v.buttons.cancel.disabled);
-	calls.length = 0;
-	v.updateStatus(status);
-	assert(!v.buttons.test.disabled && !v.buttons.restart.disabled && v.buttons.cancel.disabled);
-	assert(calls.some(c => c[0] == 'environment'), '测速结束后应重新检测环境');
+	// 导出等待对应任务终态；UCI 提交完成后才应用。
+	v.pendingExport='export1';calls.length=0;
+	v.updateStatus({...status,last_task:{id:'export1',kind:'report',status:'queued'}});
+	assert.strictEqual(v.pendingExport,'export1');
+	v.updateStatus({...status,report_ready:true,last_task:{id:'export1',kind:'report',status:'success',code:'REPORT_READY'}});
+	await tick();assert.strictEqual(v.pendingExport,null);
+	assert(downloads.includes('/tmp/xbox-accel/diagnostic-report.json'));
+	v.updateStatus(status);calls.length=0;
+	await v.handleSaveApply({},'0');
+	assert(calls.some(c=>c[0]==='super'));assert(!calls.some(c=>c[0]==='action'));
+	listeners.get('uci-applied')();await tick();
+	assert(calls.some(c=>c[0]==='action'&&c[1]==='apply'));
+	assert(!listeners.has('uci-applied'));
 
-	// “保存并应用”：配置提交完成之前不得让服务重新载入
-	calls.length = 0;
-	await v.handleSaveApply({}, '0');
-	assert(calls.some(c => c[0] == 'super' && c[1] == 'handleSaveApply'));
-	assert(!calls.some(c => c[0] == 'action'), '提交完成前不应调用 apply');
-	listeners.get('uci-applied')();
-	await new Promise(resolve => setImmediate(resolve));
-	assert(calls.some(c => c[0] == 'action' && c[1] == 'apply'));
-	assert(!listeners.has('uci-applied'), '监听器应只触发一次');
-
-	console.log('LuCI view (mocked): PASS');
-})().catch(e => { console.error(e); process.exit(1); });
+	// 载入请求被浏览器中断：自动重试后完整渲染，配置与状态都取得。
+	v.retryDelay=1;faults.uci=2;faults.status=1;
+	await v.render(await v.load());
+	assert.strictEqual(faults.uci,0);assert.strictEqual(faults.status,0);
+	assert(!v.loadFailed&&text(v.statusNode).includes('加速运行中')&&!v.buttons.test.disabled,'短暂中断后页面完整渲染');
+	// 持续中断：显示可恢复页面并隐藏保存按钮，替代停留在“正在载入视图”。
+	faults.uci=Infinity;
+	const failed=await v.render(await v.load());
+	assert(v.loadFailed&&text(failed).includes('XHR request aborted by browser')&&text(failed).includes('重新加载'));
+	assert.strictEqual(text(v.addFooter()),'','失败页面不提供保存');
+	await find(failed,'xbox-accel-reload').attrs.click();
+	assert(v.loadFailed&&find(viewNode,'xbox-accel-load-error'),'仍然失败时保留可重试页面');
+	// 连接恢复后原地重新载入，补回保存按钮。
+	faults.uci=0;calls.length=0;
+	await find(viewNode,'xbox-accel-reload').attrs.click();
+	assert(!v.loadFailed&&!find(viewNode,'xbox-accel-load-error')&&find(viewNode,'xbox-accel-status'));
+	assert(calls.some(c=>c[0]==='super'&&c[1]==='addFooter'));
+	// 渲染阶段的请求中断同样重试；超时直接给出可恢复页面；程序错误照常抛出。
+	faults.render=1;await v.render(await v.load());assert(!v.loadFailed&&faults.render===0);
+	faults.render=2;faults.error=new Error('XHR request timed out');
+	assert(find(await v.render(await v.load()),'xbox-accel-load-error')&&v.loadFailed);
+	assert.strictEqual(faults.render,1,'超时已等待完整时限，交给用户决定是否重试');
+	faults.render=1;faults.error=new TypeError('boom');
+	await assert.rejects(v.load().then(data=>v.render(data)),/boom/);
+	faults.error=null;await v.render(await v.load());assert(!v.loadFailed);
+	// 轮询：偶发中断保留上次状态和可用操作，连续三次才提示；非中断类错误立即提示。
+	const pollNow=()=>{v.nextStatusPoll=0;return pollStatus();};
+	faults.status=2;await pollNow();await pollNow();
+	assert(text(v.statusNode).includes('加速运行中')&&!v.buttons.test.disabled);
+	await pollNow();faults.status=3;await pollNow();await pollNow();
+	assert(text(v.statusNode).includes('加速运行中'),'成功读取后重新计数');
+	await pollNow();
+	assert(text(v.statusNode).includes('状态读取失败')&&v.buttons.test.disabled);
+	await pollNow();assert(text(v.statusNode).includes('加速运行中')&&!v.buttons.test.disabled);
+	faults.status=1;faults.error=new Error('Object not found');await pollNow();
+	assert(text(v.statusNode).includes('Object not found'));faults.error=null;
+	console.log('LuCI user workflow: PASS');
+})().catch(error=>{console.error(error);process.exit(1);});
