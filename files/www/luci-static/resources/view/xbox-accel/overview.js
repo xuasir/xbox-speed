@@ -37,6 +37,7 @@ var CSS = '.xa-product .xa-grid{display:grid;grid-template-columns:repeat(auto-f
 	'.xa-product details.xa-disclosure{border:1px solid var(--border-color,#d9dfe5);border-radius:6px;padding:10px;margin:12px 0}' +
 	'.xa-product details.xa-disclosure>summary{cursor:pointer;font-weight:600}.xa-product .xa-table-wrap{overflow-x:auto}' +
 	'.xa-product .xa-chips{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}.xa-product .xa-chips label{padding:8px;border:1px solid var(--border-color,#d9dfe5);border-radius:6px;cursor:pointer}' +
+	'.xa-product #xbox-accel-device .xa-chips label{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%}.xa-product #xbox-accel-device .xa-chips input{flex:0 0 auto;margin:0}.xa-product #xbox-accel-device .xa-chips span{min-width:0;overflow-wrap:anywhere}' +
 	'.xa-product .xa-chips input{margin-right:6px}.xa-product .xa-progress{margin:12px 0;padding:12px;background:var(--background-color-low,#f4f6f8);border-radius:6px}' +
 	'.xa-product .xa-card .cbi-section{margin:0;border:0;padding:0}.xa-product [data-widget="CBI.ContainerValue"]{display:block;width:100%;min-width:0;margin:12px 0}' +
 	'.xa-product [data-widget="CBI.ContainerValue"]>.cbi-value-field{margin:0;width:100%}.xa-product [data-widget="CBI.ContainerValue"]>.cbi-value-title{display:none}' +
@@ -127,8 +128,13 @@ return view.extend({
 		this.envNote=E('p',{'class':'xa-muted'});this.logNote=E('p',{'class':'xa-muted'});
 		this.taskDetails=E('div',{id:'xbox-accel-task-details'});this.eventsNode=E('div',{id:'xbox-accel-events'});
 		this.logNode=E('textarea',{id:'xbox-accel-log',readonly:'readonly',wrap:'off',rows:14,style:'width:100%;font-family:monospace;font-size:12px'});
-		this.selectedDevice='';this.disclosures={};
-		this.deviceSelect=E('select',{id:'xbox-accel-device',change:function(){self.selectedDevice=this.value;self.updateDownloads(self.latestStatus);}});
+		this.selectedDevices=[];this.deviceInputs={};this.deviceChoiceKey=null;this.disclosures={};
+		this.deviceSelection=E('span',{'class':'xa-muted','aria-live':'polite'});
+		this.deviceAll=E('button',{type:'button','class':'btn cbi-button',click:function(){self.selectDevices([]);}},['全部设备']);
+		this.deviceOptions=E('div',{'class':'xa-chips'});
+		this.devicePicker=E('div',{id:'xbox-accel-device',role:'group','aria-label':'下载设备（可多选）'},[
+			E('div',{'class':'xa-actions'},[this.deviceAll,this.deviceSelection]),this.deviceOptions
+		]);
 		this.recordFilter=E('select',{id:'xbox-accel-record-filter',change:function(){self.updateRecords(self.latestRecords||{});}},[E('option',{value:'all'},['全部事件']),E('option',{value:'errors'},['异常事件'])]);
 		this.button=function(label,command,args,confirmText,predicate){
 			var node=E('button',{'class':'btn cbi-button cbi-button-action',type:'button',click:function(){
@@ -162,8 +168,8 @@ return view.extend({
 		var settings,o;
 		panel('overview','_overview',function(){return E('div',{},[
 			self.statusNode,E('div',{'class':'xa-actions'},[linkButton('选择加速功能','functions'),linkButton('按需测速','test'),self.button('检查生效','verify')]),self.featureNode,
-			E('h3',{},['真实下载状态']),E('p',{'class':'xa-muted'},['开始设备下载后，自动观察实际连接与当前节点的匹配情况。']),
-			E('label',{},['下载设备 ',self.deviceSelect]),self.downloadNode
+			E('h3',{},['真实下载状态']),E('p',{'class':'xa-muted'},['开始设备下载后，自动观察实际连接与当前节点的匹配情况。默认展示全部设备，可勾选多台设备一起查看。']),
+			E('p',{},['下载设备（可多选）']),self.devicePicker,self.downloadNode
 		]);});
 		settings=section('functions','_basic','加速服务',false);
 		flag(settings,'enabled','启动加速','0','按已选择的功能应用下载节点。');
@@ -312,6 +318,36 @@ return view.extend({
 	navigateTab:function(tab){this.activeTab=tab;this.nextStatusPoll=0;var anchor=this.formNode&&this.formNode.querySelector&&this.formNode.querySelector('.cbi-tabmenu [data-tab="'+tab+'"] a');if(anchor)anchor.click();},
 	selectedGroups:function(){var self=this;return PLATFORMS.filter(function(p){return self.groupInputs[p.id]&&self.groupInputs[p.id].checked;}).map(function(p){return p.id;});},
 	selectGroups:function(groups){var self=this;PLATFORMS.forEach(function(p){if(self.groupInputs[p.id])self.groupInputs[p.id].checked=groups.indexOf(p.id)!==-1;});},
+	selectDevices:function(devices){
+		this.selectedDevices=devices;
+		if(this.statusValid)this.updateStatus(this.latestStatus);
+		else this.updateDevicePicker((this.latestStatus.observation||{}).devices||[]);
+	},
+	updateDevicePicker:function(devices){
+		var self=this,seen={},choices=[];
+		devices.forEach(function(device){if(device.ip&&!seen[device.ip]){seen[device.ip]=true;choices.push(device);}});
+		this.selectedDevices.forEach(function(ip){if(!seen[ip]){seen[ip]=true;choices.push({ip:ip,pending:true});}});
+		var labels=choices.map(function(device){
+			var item=self.deviceInputs[device.ip];
+			if(!item){
+				var input=E('input',{type:'checkbox',value:device.ip,change:function(){
+					var selected=self.selectedDevices.filter(function(ip){return ip!==device.ip;});
+					if(this.checked)selected.push(device.ip);
+					self.selectDevices(selected);
+				}}),label=E('span',{});
+				item=self.deviceInputs[device.ip]={input:input,label:label,node:E('label',{},[input,label])};
+			}
+			item.name=device.name||item.name||device.ip;
+			item.input.checked=self.selectedDevices.indexOf(device.ip)!==-1;
+			item.label.textContent=(item.name===device.ip?device.ip:item.name+'（'+device.ip+'）')+(device.pending?' · 等待观测':'');
+			return item.node;
+		});
+		var key=choices.map(function(device){return device.ip;}).join(',');
+		if(this.deviceChoiceKey!==key){dom.content(this.deviceOptions,labels);this.deviceChoiceKey=key;}
+		Object.keys(this.deviceInputs).forEach(function(ip){if(!seen[ip])delete self.deviceInputs[ip];});
+		this.deviceAll.disabled=this.selectedDevices.length===0;
+		this.deviceSelection.textContent=this.selectedDevices.length?'已选择 '+this.selectedDevices.length+' 台设备':'当前显示全部设备';
+	},
 	updateStatus:function(status){
 		var self=this,invalid=!!status.status_error||typeof status.enabled!=='boolean'||typeof status.running!=='boolean',task=status.last_task,busy=busyTask(status),application=status.last_application;
 		if(invalid){
@@ -327,7 +363,7 @@ return view.extend({
 		var service=status.enabled?(status.running?'加速运行中':'加速启动异常'):'加速已关闭';
 		var verification=application&&application.status!=='none'?(APPLY_STATES[application.status]||'等待确认')+' · '+formatTime(application.checked_at):'等待首次验收';
 		if(application&&application.same_configuration===false)verification+=' · 配置已变化，等待重新检查';
-		var rows=[['加速服务',service],['最近验收',verification],['最近测速',taskText(status.last_test,false)],['最近操作',taskText(task,false)]];
+		var rows=[['当前插件版本',status.version||'等待读取'],['加速服务',service],['最近验收',verification],['最近测速',taskText(status.last_test,false)],['最近操作',taskText(task,false)]];
 		dom.content(this.statusNode,rows.map(function(row){return E('tr',{'class':'tr'},[E('td',{'class':'td',style:'width:25%'},[row[0]]),E('td',{'class':'td'},[row[1]])]);}));
 		var active=PLATFORMS.filter(function(p){return groupEnabled(status,p.id);});
 		dom.content(this.featureNode,active.map(function(p){
@@ -361,13 +397,13 @@ return view.extend({
 		var status=this.latestStatus||{},busy=busyTask(status),pending=!!this.actionInFlight,valid=this.statusValid;
 		this.actionButtons.forEach(function(button){button.node.disabled=!valid||(button.command==='cancel'?!busy:busy||pending||!!(button.predicate&&!button.predicate(status)));});
 	},
-	flowsFor:function(status,group){var observation=status.observation||{},selected=this.selectedDevice;if(!observation.fresh||!observation.available||!status.enabled)return [];return(observation.flows||[]).filter(function(flow){return(!selected||flow.device_ip===selected)&&(flow.groups||'').split(',').indexOf(group)!==-1;});},
+	flowsFor:function(status,group){var observation=status.observation||{},selected=this.selectedDevices;if(!observation.fresh||!observation.available||!status.enabled)return [];return(observation.flows||[]).filter(function(flow){return(!selected.length||selected.indexOf(flow.device_ip)!==-1)&&(flow.groups||'').split(',').indexOf(group)!==-1;});},
 	updateDownloads:function(status){
-		var observation=status.observation||{},selected=this.selectedDevice,devices=observation.devices||[];
-		dom.content(this.deviceSelect,[E('option',{value:''},['全部设备'])].concat(devices.map(function(device){return E('option',{value:device.ip},[device.name===device.ip?device.ip:device.name+'（'+device.ip+'）']);})));this.deviceSelect.value=selected||'';
+		var observation=status.observation||{},selected=this.selectedDevices,devices=observation.devices||[];
+		this.updateDevicePicker(devices);
 		if(!status.enabled){dom.content(this.downloadNode,[E('p',{'class':'xa-muted'},['开启加速后，自动观察设备下载连接。'])]);return;}
 		if(!observation.fresh||!observation.available){dom.content(this.downloadNode,[E('p',{'class':'xa-muted'},[observation.available?'下载观测正在更新，最近记录于 '+formatTime(observation.observed_at):'连接观测能力待确认，配置验收结果可在上方查看。'])]);return;}
-		var flows=(observation.flows||[]).filter(function(flow){return!selected||flow.device_ip===selected;}),redirects=(observation.redirects||[]).filter(function(item){return!selected||item.device_ip===selected;});
+		var flows=(observation.flows||[]).filter(function(flow){return!selected.length||selected.indexOf(flow.device_ip)!==-1;}),redirects=(observation.redirects||[]).filter(function(item){return!selected.length||selected.indexOf(item.device_ip)!==-1;});
 		var rows=flows.map(function(flow){
 			var name=devices.find(function(device){return device.ip===flow.device_ip;}),groups=(flow.groups||'').split(',').map(function(group){return GROUP_LABELS[group]||'';}).filter(Boolean).join('、')||'平台待确认';
 			var text=FLOW_STATES[flow.status]||'待确认';if(flow.shared_node)text+=' · 共享 CDN 节点，平台待确认';
@@ -383,7 +419,12 @@ return view.extend({
 		else contents.push(E('p',{'class':'xa-muted'},['等待设备下载 · 观测更新于 '+formatTime(observation.observed_at)]));
 		if(flows.some(function(flow){return flow.status==='previous';}))contents.push(E('p',{'class':'xa-warn'},['当前连接沿用此前节点，暂停并继续下载可建立新连接。']));
 		if(flows.some(function(flow){return flow.status==='different';}))contents.push(E('p',{'class':'xa-warn'},['下载目标与当前节点存在差异，请检查设备 DNS、IPv6 和分流设置。']));
-		if(redirects.length){var latest=redirects[redirects.length-1],domestic=flows.some(function(flow){return flow.device_ip===latest.device_ip&&flow.status==='matched'&&/(^|,)cn(,|$)/.test(flow.groups);});contents.push(E('p',{'class':'xa-ok'},[(domestic?'已观察到重定向请求与国内节点连接':'已观察到设备重定向请求')+' · '+latest.host+' → '+latest.target_host+' · '+formatTime(latest.observed_at)]));}
+		var deviceRedirects={};redirects.forEach(function(item){deviceRedirects[item.device_ip]=item;});
+		Object.keys(deviceRedirects).forEach(function(ip){
+			var latest=deviceRedirects[ip],device=devices.find(function(item){return item.ip===ip;}),name=device&&device.name||ip;
+			var domestic=flows.some(function(flow){return flow.device_ip===ip&&flow.status==='matched'&&/(^|,)cn(,|$)/.test(flow.groups);});
+			contents.push(E('p',{'class':'xa-ok'},[(name===ip?ip:name+'（'+ip+'）')+' · '+(domestic?'已观察到重定向请求与国内节点连接':'已观察到设备重定向请求')+' · '+latest.host+' → '+latest.target_host+' · '+formatTime(latest.observed_at)]));
+		});
 		dom.content(this.downloadNode,contents);
 	},
 	updateMeasurements:function(status){

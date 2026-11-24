@@ -93,6 +93,7 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 		assert(!v.disclosures[id].open,'高级内容默认折叠：'+id);
 	assert.strictEqual(options.find(o=>o.name==='_records').tab,'records');
 	assert.strictEqual(v.logNode.value,status.log);
+	assert(text(v.statusNode).includes('当前插件版本')&&text(v.statusNode).includes(status.version));
 	assert(!text(v.statusNode).includes('TASK_'),'首页摘要只展示用户可读结论');
 	assert(!v.buttons.test.disabled && v.buttons.cancel.disabled);
 	assert(v.buttons.adopt_ps.disabled,'取得结果后才可采用');
@@ -146,23 +147,42 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 	assert(!v.buttons.test.disabled);
 
 	// 设备节点命中与分流证据分别显示；共享目标和旧连接保持准确措辞。
-	const devices=[{ip:'192.168.1.20',name:'Xbox'},{ip:'192.168.1.21',name:'<script>device</script>'}];
+	const devices=[{ip:'192.168.1.20',name:'Xbox'},{ip:'192.168.1.21',name:'<script>device</script>'},{ip:'192.168.1.22',name:'Switch'}];
 	const flow={device_ip:'192.168.1.20',target_ip:'8.8.4.4',target_port:443,groups:'cn',status:'matched',path:'unknown',
 		speed_bps:12300000,observed_at:1700000000,activity:'downloading'};
-	const observation={fresh:true,available:true,observed_at:1700000000,devices,flows:[flow,{...flow,device_ip:'192.168.1.21',target_ip:'1.1.1.1',groups:'com',path:'direct'}]};
+	const observation={fresh:true,available:true,observed_at:1700000000,devices,
+		flows:[flow,{...flow,device_ip:'192.168.1.21',target_ip:'1.1.1.1',groups:'com',path:'direct'},
+			{...flow,device_ip:'192.168.1.22',target_ip:'9.9.9.9',status:'different'}],
+		redirects:devices.map((device,index)=>({device_ip:device.ip,host:'device'+index+'.xboxlive.com',target_host:'assets1.xboxlive.cn',observed_at:1700000000}))};
 	v.updateStatus({...status,observation});
 	assert(text(v.downloadNode).includes('已命中当前节点')&&text(v.downloadNode).includes('分流路径待确认'));
 	assert(text(v.downloadNode).includes('12.30 MB/s（估算）'));
-	v.selectedDevice='192.168.1.20';v.updateDownloads({...status,observation});
+	const firstDevice=v.deviceInputs['192.168.1.20'].input;
+	firstDevice.checked=true;firstDevice.attrs.change.call(firstDevice);
 	assert(!text(v.downloadNode).includes('1.1.1.1:443'));
 	assert(!text(v.downloadNode).includes('直连已确认'));
+	const secondDevice=v.deviceInputs['192.168.1.21'].input;
+	secondDevice.checked=true;secondDevice.attrs.change.call(secondDevice);
+	assert.deepStrictEqual(v.selectedDevices,['192.168.1.20','192.168.1.21']);
+	assert(text(v.downloadNode).includes('8.8.4.4:443')&&text(v.downloadNode).includes('1.1.1.1:443'));
+	assert(!text(v.downloadNode).includes('9.9.9.9:443'));
+	assert(text(v.downloadNode).includes('device0.xboxlive.com')&&text(v.downloadNode).includes('device1.xboxlive.com'));
+	assert(!text(v.downloadNode).includes('device2.xboxlive.com'));
+	assert(!text(v.featureNode).includes('下载目标与配置存在差异'));
+	v.updateStatus({...status,observation});
+	assert.strictEqual(v.deviceInputs['192.168.1.20'].input,firstDevice);
+	assert(firstDevice.checked&&secondDevice.checked&&text(v.deviceSelection).includes('2 台设备'));
+	v.updateStatus({status_error:'RPC unavailable'});v.deviceAll.attrs.click();
+	assert(text(v.downloadNode).includes('暂停更新'));
+	v.updateStatus({...status,observation});
+	assert(text(v.downloadNode).includes('9.9.9.9:443'));
 	v.updateStatus({...status,observation:{...observation,flows:[{...flow,status:'previous',shared_node:true}]}});
 	assert(text(v.featureNode).includes('连接沿用旧节点'));
 	assert(!text(v.featureNode).includes('共享节点命中'));
 	assert(text(v.downloadNode).includes('暂停并继续'));
 	v.updateStatus({...status,observation:{...observation,fresh:false}});
 	assert(!text(v.downloadNode).includes('已命中当前节点'));
-	v.selectedDevice='';
+	v.selectDevices([]);
 	v.updateStatus({...status,last_application:{status:'verified',router:'verified',same_configuration:false,checked_at:1700000000}});
 	assert(text(v.statusNode).includes('配置已变化'));
 	assert(text(v.featureNode).includes('等待检查'));
