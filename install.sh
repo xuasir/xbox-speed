@@ -10,18 +10,33 @@ SRC=$(cd "$(dirname "$0")" && pwd)/files
 FILES="
 /usr/bin/xbox-accel
 /etc/init.d/xbox-accel
-/www/cgi-bin/xbox-accel-redirect
+/usr/share/xbox-accel/redirect.cgi
+/usr/share/xbox-accel/redirect.sh
+/usr/share/xbox-accel/firewall.sh
 /usr/share/xbox-accel/seeds.cn
 /usr/share/xbox-accel/seeds.com
+/usr/share/xbox-accel/seeds.store
+/usr/share/xbox-accel/seeds.ps
+/usr/share/xbox-accel/seeds.xbox_old
+/usr/share/xbox-accel/seeds.switch
+/usr/share/xbox-accel/platforms.sh
 /usr/share/xbox-accel/ecs.telecom
 /usr/share/xbox-accel/ecs.unicom
 /usr/share/xbox-accel/ecs.mobile
+/usr/share/xbox-accel/diagnostics.sh
+/usr/share/xbox-accel/verification.sh
+/usr/share/xbox-accel/application.sh
+/usr/share/xbox-accel/privacy.sh
+/usr/share/xbox-accel/quick-check.sh
+/usr/share/xbox-accel/measurement.sh
+/usr/share/xbox-accel/records.sh
+/usr/share/xbox-accel/observation.sh
 /usr/libexec/rpcd/xbox-accel
 /usr/share/luci/menu.d/luci-app-xbox-accel.json
 /usr/share/rpcd/acl.d/luci-app-xbox-accel.json
 /www/luci-static/resources/view/xbox-accel/overview.js
 "
-EXECUTABLES="/usr/bin/xbox-accel /etc/init.d/xbox-accel /www/cgi-bin/xbox-accel-redirect /usr/libexec/rpcd/xbox-accel"
+EXECUTABLES="/usr/bin/xbox-accel /etc/init.d/xbox-accel /usr/share/xbox-accel/redirect.cgi /usr/share/xbox-accel/firewall.sh /usr/libexec/rpcd/xbox-accel"
 
 [ "$(id -u)" = 0 ] || { echo "请用 root 执行" >&2; exit 1; }
 [ -f /etc/openwrt_release ] || { echo "这不是 OpenWrt 系统" >&2; exit 1; }
@@ -63,6 +78,7 @@ do_remove() {
 		/etc/init.d/xbox-accel disable >/dev/null 2>&1 || true
 	fi
 	for f in $FILES; do rm -f "$f"; done
+	rm -f /www/cgi-bin/xbox-accel-redirect
 	rmdir /usr/share/xbox-accel /www/luci-static/resources/view/xbox-accel 2>/dev/null || true
 	rm -rf /var/etc/xbox-accel /var/run/xbox-accel /tmp/xbox-accel
 	refresh_luci
@@ -98,6 +114,8 @@ echo "== 依赖"
 echo "  dnsmasq：$(/usr/sbin/dnsmasq -v | awk 'NR==1{print $3}')"
 command -v flock >/dev/null 2>&1 || { echo "  缺少 flock（通常由 BusyBox 提供）" >&2; exit 1; }
 need "curl" "command -v curl" curl
+need "下载连接观测" "command -v conntrack" conntrack
+need "HTTPS CA 证书" "test -s /etc/ssl/certs/ca-certificates.crt" ca-bundle
 need "jshn" "test -f /usr/share/libubox/jshn.sh" jshn
 need "rpcd" "test -x /sbin/rpcd" rpcd
 need "LuCI" "test -f /www/luci-static/resources/luci.js" luci-base
@@ -111,6 +129,7 @@ fi
 if [ -x /etc/init.d/xbox-accel ]; then
 	/etc/init.d/xbox-accel stop || { echo "旧版本停用失败，已取消升级" >&2; exit 1; }
 fi
+rm -f /www/cgi-bin/xbox-accel-redirect
 
 echo "== 文件"
 for f in $FILES; do
@@ -126,6 +145,8 @@ else
 fi
 /etc/init.d/xbox-accel enable
 refresh_luci
+# Nginx 提供 LuCI 的固件上，取消端口冲突的 uhttpd 主实例开机自启
+/usr/bin/xbox-accel _web_guard || true
 echo "  已安装 xbox-accel $(/usr/bin/xbox-accel --version)"
 
 if [ "$(uci -q get xbox-accel.main.enabled)" = 1 ]; then
@@ -137,6 +158,7 @@ cat <<'TIP'
 
 安装完成。插件默认不启用，此时没有改动任何系统配置。
   网页：LuCI → 服务 → Xbox 下载加速（看不到菜单时请重新登录 LuCI）
-  命令：xbox-accel check     环境检测
-        xbox-accel enable    启用（会自动开始第一次测速）
+  命令：xbox-accel measure ps  独立测速（支持关闭的平台）
+        xbox-accel check       检查生效
+        xbox-accel enable      启用（缺少节点时自动首次选优）
 TIP

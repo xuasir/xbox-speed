@@ -29,12 +29,22 @@ class BuildTests(unittest.TestCase):
             package = pathlib.Path(temporary) / result['ipk']
             with inner_tar(package, 'control.tar.gz') as control:
                 self.assertIn(f'Version: {ver}-1\n', control.extractfile('./control').read().decode())
+                self.assertIn('conntrack', control.extractfile('./control').read().decode().split('Depends: ', 1)[1].split('\n', 1)[0])
                 self.assertEqual(control.getmember('./postinst').mode, 0o755)
+                self.assertIn('/usr/bin/xbox-accel _web_guard || true\n', control.extractfile('./postinst').read().decode())
             with inner_tar(package, 'data.tar.gz') as data:
                 self.assertEqual(data.getmember('./usr/bin/xbox-accel').mode, 0o755)
                 self.assertEqual(data.getmember('./etc/config/xbox-accel').mode, 0o600)
                 self.assertEqual(data.getmember('./www/luci-static/resources/view/xbox-accel/overview.js').mode, 0o644)
                 self.assertIn(f'VERSION={ver}\n', data.extractfile('./usr/bin/xbox-accel').read().decode())
+                for module in ('platforms', 'diagnostics', 'verification', 'application', 'privacy', 'quick-check', 'redirect', 'measurement', 'records', 'observation'):
+                    self.assertIsNotNone(data.extractfile(f'./usr/share/xbox-accel/{module}.sh'))
+                    self.assertEqual(data.getmember(f'./usr/share/xbox-accel/{module}.sh').mode, 0o644)
+                for script in ('redirect.cgi', 'firewall.sh'):
+                    self.assertEqual(data.getmember(f'./usr/share/xbox-accel/{script}').mode, 0o755)
+                self.assertNotIn('./www/cgi-bin/xbox-accel-redirect', data.getnames())
+                for group in ('store', 'ps', 'xbox_old', 'switch'):
+                    self.assertIsNotNone(data.extractfile(f'./usr/share/xbox-accel/seeds.{group}'))
             self.assertEqual(result['channel'], 'stable')
             self.assertEqual(len(result['assets']), 5)
 

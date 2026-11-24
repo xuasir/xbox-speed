@@ -1,9 +1,9 @@
 #!/bin/sh
-# xbox-accel: Xbox 下载 CDN 优选 + com→cn 重定向（OpenWrt）
+# xbox-accel: 游戏平台下载 CDN 优选 + Xbox com→cn 重定向（OpenWrt）
 # 结构：主 dnsmasq 只写固定规则，把 Xbox 下载域名交给本插件的解析实例；
 #       换节点、切模式只改解析实例的配置，不动主 dnsmasq。
 
-VERSION=0.2.2
+VERSION=0.3.0
 NAME=xbox-accel
 STATE_DIR=/etc/xbox-accel
 RUN_DIR=/var/run/xbox-accel
@@ -12,6 +12,9 @@ RESOLVER_CONF=/var/etc/xbox-accel/dnsmasq.conf
 SHARE_DIR=/usr/share/xbox-accel
 INIT=/etc/init.d/xbox-accel
 CGI_URL=/cgi-bin/xbox-accel-redirect
+REDIRECT_ROOT=/var/etc/xbox-accel/redirect
+REDIRECT_CONF=/var/etc/xbox-accel/redirect.conf
+REDIRECT_HTTPD_CONF=/var/etc/xbox-accel/redirect.httpd.conf
 CRON_FILE=/etc/crontabs/root
 CRON_TAG='# xbox-accel'
 
@@ -47,11 +50,15 @@ say() {
 
 note() {
 	say "$*"
-	logger -t "$NAME" -- "$*" 2>/dev/null
+	system_log "$*"
 	return 0
 }
 
 die() {
+	if [ -n "${TASK_ID:-}" ]; then
+		TASK_STATUS=failed; TASK_MESSAGE="$*"
+		[ "$TASK_CODE" = RUNNING ] && TASK_CODE=FATAL_ERROR
+	fi
 	if [ "$QUIET" = 1 ]; then
 		printf '%s 错误：%s\n' "$(stamp)" "$*"
 	else
@@ -69,9 +76,46 @@ rotate_log() {
 	rm -f "$LOG_FILE.new"
 }
 
-# 运行其他服务的脚本时关闭本进程持有的锁：它们拉起的常驻进程会继承已打开的文件，
-# 锁一旦被继承就永远不会释放。
-svc() { "$@" >/dev/null 2>&1 7>&- 8>&- 9>&-; }
+# 在服务子进程中清理全部继承描述符，调用方继续持有自己的锁。
+close_service_fds() {
+	local descriptor directory=/proc/self/fd
+	[ -d "$directory" ] || directory=/dev/fd
+	for descriptor in "$directory"/*; do
+		descriptor=${descriptor##*/}
+		case "$descriptor" in ''|*[!0-9]*|0|1|2) continue ;; esac
+		eval "exec $descriptor>&-"
+	done
+}
+
+# 系统日志写入最多等待两秒；完整任务日志先保存在插件自己的目录。
+system_log() {
+	local writer watchdog
+	(
+		close_service_fds
+		exec logger -t "$NAME" -- "$*"
+	) >/dev/null 2>&1 &
+	writer=$!
+	(
+		close_service_fds
+		local timer
+		sleep 2 & timer=$!
+		trap 'kill "$timer" 2>/dev/null; exit 0' INT TERM
+		wait "$timer"
+		kill -KILL "$writer" 2>/dev/null
+	) >/dev/null 2>&1 &
+	watchdog=$!
+	wait "$writer" 2>/dev/null || true
+	kill -TERM "$watchdog" 2>/dev/null
+	wait "$watchdog" 2>/dev/null
+	return 0
+}
+
+svc() {
+	(
+		close_service_fds
+		"$@" >/dev/null 2>&1
+	)
+}
 
 cfg() {
 	local v
@@ -79,9 +123,37 @@ cfg() {
 	if [ -n "$v" ]; then echo "$v"; else echo "$2"; fi
 }
 
+# 每个进程只读取一次采集模式，省去逐行 UCI 查询。
+LOG_MODE=$(cfg log_mode concise)
+case "$LOG_MODE" in concise|detail) ;; *) LOG_MODE=concise ;; esac
+
+# 未设置新字段的旧配置继续使用原 cron；新计划统一转换为 cron。
+schedule_cron() {
+	local kind time day
+	kind=$(cfg schedule_type legacy)
+	[ "$kind" = off ] && return 0
+	[ "$kind" = legacy ] && { cfg cron '15 5 * * *'; return; }
+	case "$kind" in daily|weekly|monthly) ;; *) return 1 ;; esac
+	time=$(cfg schedule_time '05:15')
+	printf '%s\n' "$time" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$' || return 1
+	case "$kind" in
+	daily) day='* * *' ;;
+	weekly)
+		day=$(cfg schedule_weekday 0)
+		case "$day" in [0-6]) ;; *) return 1 ;; esac
+		day="* * $day" ;;
+	monthly)
+		day=$(cfg schedule_monthday 1)
+		printf '%s\n' "$day" | grep -qE '^([1-9]|[12][0-9]|3[01])$' || return 1
+		day="$day * *" ;;
+	esac
+	printf '%s\n' "$time" | awk -F: -v day="$day" '{printf "%d %d %s\n",$2,$1,day}'
+}
+
 schedule_label() {
 	local plan
-	plan=$(cfg cron '15 5 * * *')
+	[ "$(cfg schedule_type legacy)" = off ] && { echo '仅手动测速'; return; }
+	plan=$(schedule_cron) || { echo '测速计划设置无效'; return; }
 	case "$plan" in
 	'*/30 * * * *') echo '每 30 分钟（每小时 00、30 分）' ;;
 	'0 * * * *') echo '每小时整点' ;;
@@ -89,7 +161,12 @@ schedule_label() {
 	'0 */6 * * *') echo '每 6 小时（00、06、12、18 点）' ;;
 	'0 */12 * * *') echo '每 12 小时（00、12 点）' ;;
 	'0 3 * * 0') echo '每周日 03:00' ;;
-	*) printf '%s\n' "$plan" | awk '{if(NF==5 && $1~/^[0-9]+$/ && $2~/^[0-9]+$/ && $3=="*" && $4=="*" && $5=="*") printf "每天 %02d:%02d\n",$2,$1; else print "保留的自定义计划"}' ;;
+	*) printf '%s\n' "$plan" | awk 'BEGIN{split("日 一 二 三 四 五 六",days," ")} {
+	 if(NF==5 && $1~/^[0-9]+$/ && $2~/^[0-9]+$/ && $4=="*") {
+	  if($3=="*" && $5=="*") {printf "每天 %02d:%02d\n",$2,$1; exit}
+	  if($3=="*" && $5~/^[0-7]$/) {printf "每周%s %02d:%02d\n",days[($5%7)+1],$2,$1; exit}
+	  if($3~/^[0-9]+$/ && $3>=1 && $3<=31 && $5=="*") {printf "每月 %d 号 %02d:%02d%s\n",$3,$2,$1,($3>28?"（无该日期的月份跳过）":""); exit}
+	 } print "保留的自定义计划"}' ;;
 	esac
 }
 
@@ -135,13 +212,15 @@ fmt_speed() {
 	awk -v b="$1" 'BEGIN { printf "%.2f MB/s（%.0f Mbps）", b/1000000, b*8/1000000 }'
 }
 
-url_host() { local u=${1#http://}; echo "${u%%/*}"; }
-url_path() { local u=${1#http://}; echo "/${u#*/}"; }
+url_scheme() { printf '%s\n' "${1%%://*}"; }
+url_host() { local u=${1#*://}; printf '%s\n' "${u%%/*}"; }
+url_path() { local u=${1#*://}; printf '/%s\n' "${u#*/}"; }
 
 group_url() {
 	case "$1" in
 	cn) cfg test_url_cn "$DEF_URL_CN" ;;
 	com) cfg test_url_com "$DEF_URL_COM" ;;
+	*) platform_url "$1" ;;
 	esac
 }
 
@@ -157,9 +236,9 @@ best_domains() { cat "$STATE_DIR/domains_$1" 2>/dev/null; }
 
 lan_ip() {
 	local ip
-	ip=$(cfg redirect_ip "")
+	ip=$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
 	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr | awk '{print $1}')
-	[ -n "$ip" ] || ip=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{print $2; exit}')
+	[ -n "$ip" ] || ip=$(ip -4 addr show dev "$(redirect_device)" 2>/dev/null | awk '/inet /{print $2; exit}')
 	echo "${ip%%/*}" | ipv4s | head -n 1
 }
 
@@ -183,6 +262,8 @@ port_available() {
 # 修改系统配置前拒绝无效参数，尤其防止解析回环和 cron 注入。
 validate_config() {
 	local port s schedule url host g spec key min max v
+
+	case "$(cfg log_mode concise)" in concise|detail) ;; *) die "日志模式请选择 concise 或 detail" ;; esac
 	for spec in 'quick_size_mb:1:128:4' 'full_size_mb:1:256:64' 'quick_time:1:30:4' 'full_time:1:60:10' 'top_n:1:10:3' 'max_candidates:1:100:60' 'switch_threshold:0:100:15' 'ttl:5:600:30' 'health_interval:0:59:10'; do
 		key=${spec%%:*}; spec=${spec#*:}; min=${spec%%:*}; spec=${spec#*:}; max=${spec%%:*}
 		v=$(cfg "$key" "${spec#*:}")
@@ -199,7 +280,8 @@ validate_config() {
 	for s in $(cfg fallback_dns "223.5.5.5 119.29.29.29"); do
 		[ "$(printf '%s' "$s" | ipv4s | public_only)" = "$s" ] || die "fallback_dns 只允许公网 IPv4，避免回环"
 	done
-	schedule=$(cfg cron "15 5 * * *")
+	schedule=$(schedule_cron) || die "定时测速计划无效：检查频率、HH:MM、星期几或每月日期"
+	if [ "$(cfg schedule_type legacy)" != off ]; then
 	[ "$(printf '%s' "$schedule" | tr -d '0-9*/ ,\055')" = "" ] || die "cron 含非法字符"
 	set -f
 	set -- $schedule
@@ -217,25 +299,18 @@ validate_config() {
 	 } return 1;
 	}
 	{exit !(NF==5&&valid($1,0,59)&&valid($2,0,23)&&valid($3,1,31)&&valid($4,1,12)&&valid($5,0,7))}' || die "cron 字段值或范围无效"
+	fi
 	for g in cn com; do
 		url=$(group_url "$g")
 		host=$(url_host "$url")
-		[ "$host" = "assets1.xboxlive.$g" ] || die "测速 URL 必须使用 http://assets1.xboxlive.$g/ 路径"
+		[ "$(url_scheme "$url")" = http ] && [ "$host" = "assets1.xboxlive.$g" ] && platform_url_valid "$g" "$url" || die "测速 URL 必须使用 http://assets1.xboxlive.$g/ 路径"
 	done
-}
-
-# ---------- 重定向（com→cn）前置条件 ----------
-
-# 输出不能启用的原因；可以启用时无输出
-redirect_blocker() {
-	[ -x /usr/sbin/uhttpd ] || { echo "未安装 uhttpd"; return; }
-	uci -q get uhttpd.main >/dev/null || { echo "找不到 uhttpd.main 配置"; return; }
-	uci -q get uhttpd.main.listen_http | tr ' ' '\n' | grep -qE ':80$' ||
-		{ echo "uhttpd 没有监听 80 端口"; return; }
-	[ "$(uci -q get uhttpd.main.redirect_https)" = 1 ] &&
-		{ echo "uhttpd 开启了强制跳转 HTTPS（redirect_https）"; return; }
-	[ -x "/www$CGI_URL" ] || { echo "缺少 /www$CGI_URL"; return; }
-	[ -n "$(lan_ip)" ] || { echo "无法确定路由器 LAN IP，请设置 redirect_ip"; return; }
+	validate_platform_config
+	if cfg_bool redirect_cn 0; then
+		v=$(redirect_blocker)
+		[ -z "$v" ] || die "重定向配置无效：$v"
+	fi
+	return 0
 }
 
 # 国际域名的工作模式：redirect / optimize / off
@@ -293,36 +368,53 @@ ecs_subnets() {
 }
 
 discover() {
-	local group=$1 hosts servers h s e i=0 d="$TMP_DIR/discover.$$"
-	case "$group" in
-	cn) hosts="assets1.xboxlive.cn" ;;
-	com) hosts="assets1.xboxlive.com $CDN_HOSTS" ;;
-	esac
-	rm -rf "$d"
-	mkdir -p "$d"
-
-	# 1. 本线路：公共 DNS 与运营商下发的 DNS 按来源 IP 返回本线路节点
-	servers=$(cfg probe_dns "223.5.5.5 119.29.29.29 114.114.114.114 180.76.76.76")
+	local group=$1 hosts servers h resolver subnet index=0 d="$TMP_DIR/discover.$$"
+	hosts=$(discovery_hosts "$group")
+	rm -rf "$d"; mkdir -p "$d"
+	servers=$(cfg probe_dns '223.5.5.5 119.29.29.29 114.114.114.114 180.76.76.76')
 	cfg_bool use_isp_dns 1 && servers="$servers $(isp_dns | tr '\n' ' ')"
-	for s in $(echo "$servers" | tr ' ' '\n' | ipv4s | uniq_keep_order); do
+	for resolver in $(echo "$servers" | tr ' ' '\n' | ipv4s | uniq_keep_order); do
 		for h in $hosts; do
-			i=$((i + 1))
-			(nslookup "$h" "$s" 2>/dev/null | ipv4s | grep -vxF "$s" >"$d/a$i") &
+			index=$((index+1))
+			(
+				result=$(nslookup -timeout=3 -retry=1 "$h" "$resolver" 2>&1); rc=$?
+				ips=$(printf '%s\n' "$result" | ipv4s | grep -vxF "$resolver" | public_only | uniq_keep_order)
+				printf '%s\n' "$ips" >"$d/a$index"
+				if [ -n "$ips" ]; then
+					log_event_enabled INFO DNS_QUERY_OK && task_event INFO DNS_QUERY_OK "resolver=$resolver host=$h answers=$(echo "$ips" | tr '\n' ',')"
+				else
+					code=DNS_NO_PUBLIC_ADDRESS
+					printf '%s' "$result" | grep -qi 'NXDOMAIN' && code=DNS_NXDOMAIN
+					printf '%s' "$result" | grep -qi 'timed out' && code=DNS_QUERY_TIMEOUT
+					task_event WARN "$code" "resolver=$resolver host=$h exit=$rc；未获得公网 IPv4，请检查上游、域名和网络"
+				fi
+			) &
 		done
 	done
-	# 2. HTTPDNS：本线路，以及按运营商参考网段扩展的候选
-	for h in $hosts; do
-		i=$((i + 1))
-		(curl -s --noproxy '*' -m 6 "http://119.29.29.29/d?dn=$h" 2>/dev/null | tr ';,' '\n\n' | ipv4s >"$d/b$i") &
-	done
-	for e in $(ecs_subnets | ipv4s | uniq_keep_order); do
+	for subnet in current $(ecs_subnets | ipv4s | uniq_keep_order); do
 		for h in $hosts; do
-			i=$((i + 1))
-			(curl -s --noproxy '*' -m 6 "http://119.29.29.29/d?dn=$h&ip=$e" 2>/dev/null | tr ';,' '\n\n' | ipv4s >"$d/c$i") &
+			index=$((index+1))
+			(
+				url="http://119.29.29.29/d?dn=$h"
+				[ "$subnet" = current ] || url="$url&ip=$subnet"
+				result=$(curl -sS --noproxy '*' -m 6 "$url" 2>"$d/error$index"); rc=$?
+				ips=""
+				if [ "$rc" = 0 ] && ! printf '%s' "$result" | grep -q '[^0-9.;,[:space:]]'; then
+					ips=$(printf '%s' "$result" | tr ';,' '\n\n' | ipv4s | public_only | uniq_keep_order)
+				fi
+				printf '%s\n' "$ips" >"$d/b$index"
+				if [ -n "$ips" ]; then
+					log_event_enabled INFO HTTPDNS_QUERY_OK && task_event INFO HTTPDNS_QUERY_OK "host=$h ecs=$subnet answers=$(echo "$ips" | tr '\n' ',')"
+				else
+					code=HTTPDNS_INVALID_RESPONSE
+					[ "$rc" = 0 ] || code=$(probe_classify "$rc" 000 0 1)
+					task_event WARN "$code" "HTTPDNS host=$h ecs=$subnet curl_exit=$rc error=$(head -c 250 "$d/error$index" 2>/dev/null)；请检查请求错误与地址列表"
+				fi
+			) &
 		done
 	done
 	wait
-	cat "$d"/a* "$d"/b* "$d"/c* 2>/dev/null
+	cat "$d"/a* "$d"/b* 2>/dev/null
 	rm -rf "$d"
 }
 
@@ -332,6 +424,7 @@ candidates() {
 	[ "$max" -gt 0 ] || max=60
 	{
 		best_ip "$group"
+		cfg "extra_ips_$group" '' | tr ' ' '\n' | ipv4s
 		discover "$group"
 		[ -f "$STATE_DIR/candidates_$group" ] && ipv4s <"$STATE_DIR/candidates_$group"
 		cfg_bool use_seeds 1 && [ -f "$SHARE_DIR/seeds.$group" ] && ipv4s <"$SHARE_DIR/seeds.$group"
@@ -340,122 +433,190 @@ candidates() {
 
 # ---------- 测速 ----------
 
-# probe IP HOST PATH OFFSET BYTES TIMEOUT → “状态码 已下载字节 平均速度(B/s)”
+# probe → HTTP bytes speed curl_exit connect_s total_s remote_ip; stderr stays available to callers.
 probe() {
-	local end=$(($4 + $5 - 1))
-	curl -s -o /dev/null --noproxy '*' --connect-timeout 3 -m "$6" -r "$4-$end" \
-		--resolve "$2:80:$1" -w '%{http_code} %{size_download} %{speed_download}' \
-		"http://$2$3" 2>/dev/null
+	local ip=$1 host=$2 path=$3 offset=$4 limit=$5 timeout_s=$6 scheme=${7:-http} agent=${8:-} port=80 end stats rc
+	case "$scheme" in http) ;; https) port=443 ;; *) printf '000 0 0 3 0 0 -\n'; return ;; esac
+	end=$((offset + limit - 1))
+	mkdir -p "$TMP_DIR"
+	set -- -sS --globoff -o /dev/null --noproxy '*' --connect-timeout 3 -m "$timeout_s" --max-filesize "$limit" -r "$offset-$end" \
+		--resolve "$host:$port:$ip" -w '%{http_code} %{size_download} %{speed_download} %{time_connect} %{time_total} %{remote_ip}'
+	[ -z "$agent" ] || set -- "$@" -A "$agent"
+	stats=$(curl "$@" "$scheme://$host$path" 2>"$TMP_DIR/probe-error-$$.txt")
+	rc=$?
+	set -- $stats
+	printf '%s %s %s %s %s %s %s\n' "${1:-000}" "${2:-0}" "${3:-0}" "$rc" "${4:-0}" "${5:-0}" "${6:--}"
 }
 
 # alive IP HOST PATH OFFSET：取 1KB 判断节点是否正常提供该文件
 alive() {
-	set -- $(probe "$1" "$2" "$3" "$4" 1024 6)
-	[ "$1" = 206 ] && [ "$(to_int "$2")" -ge 1024 ]
+	local ip=$1 host=$2 result code message
+	result=$(probe "$1" "$2" "$3" "$4" 1024 6 "${5:-http}" "${6:-}")
+	set -- $result
+	code=$(probe_classify "${4:-0}" "${1:-000}" "$(to_int "$2")" 1024)
+	case "$code" in
+	OK|TIME_LIMIT_WITH_DATA) task_event DEBUG "$code" "资源验证 host=$host ip=$ip http=$1 bytes=$2 curl_exit=$4"; return 0 ;;
+	*) message=$(head -c 250 "$TMP_DIR/probe-error-$$.txt" 2>/dev/null)
+		task_event WARN "$code" "资源验证 host=$host ip=$ip http=$1 bytes=$2 curl_exit=$4 connect_s=${5:-0} total_s=${6:-0} error=$message；$(probe_advice "$code")"; return 1 ;;
+	esac
 }
 
 # 测一批 IP：stage_run 输出文件 最小有效字节 字节数 超时 HOST PATH OFFSET IP...
 stage_run() {
-	local out=$1 minb=$2 bytes=$3 tmo=$4 host=$5 path=$6 off=$7 ip r code got speed
+	local out=$1 minb=$2 bytes=$3 tmo=$4 host=$5 path=$6 off=$7 ip r code got speed rc classification message failure_codes="" failure_counts log_failure
 	shift 7
+	STAGE_VALID=0; STAGE_TOTAL=0; STAGE_LAST_CODE=NONE
+	TASK_PROGRESS_TOTAL=$#; TASK_PROGRESS_DONE=0; TASK_PROGRESS_VALID=0
 	: >"$out"
 	for ip in "$@"; do
-		r=$(probe "$ip" "$host" "$path" "$off" "$bytes" "$tmo")
+		STAGE_TOTAL=$((STAGE_TOTAL+1))
+		r=$(probe "$ip" "$host" "$path" "$off" "$bytes" "$tmo" "${PROBE_SCHEME:-http}" "${PROBE_UA:-}")
 		set -- $r
-		code=${1:-000}
-		got=$(to_int "$2")
-		speed=$(to_int "$3")
-		if [ "$code" = 206 ] && [ "$got" -ge "$minb" ]; then
+		code=${1:-000}; got=$(to_int "$2"); speed=$(to_int "$3"); rc=${4:-0}
+		classification=$(probe_classify "$rc" "$code" "$got" "$minb")
+		case "$classification" in OK|TIME_LIMIT_WITH_DATA) [ "$speed" -gt 0 ] || classification=INVALID_SPEED ;; esac
+		case "$classification" in
+		OK|TIME_LIMIT_WITH_DATA)
+			STAGE_VALID=$((STAGE_VALID+1))
 			echo "$speed $ip" >>"$out"
-			say "  $ip  $(fmt_speed "$speed")"
-		else
-			say "  $ip  不可用（HTTP $code，收到 $got 字节）"
-		fi
+			log_event_enabled INFO "$classification" && task_event INFO "$classification" "sample=$STAGE_TOTAL ip=$ip host=$host http=$code bytes=$got curl_exit=$rc connect_s=${5:-0} total_s=${6:-0} remote_ip=${7:--} speed=$(fmt_speed "$speed")"
+			;;
+		*)
+			STAGE_LAST_CODE=$classification
+			# 简洁模式保留每类失败的首个完整样本，并在阶段结束汇总次数。
+			case " $failure_codes " in *" $classification "*) log_failure=0 ;; *) log_failure=1 ;; esac
+			if [ "$LOG_MODE" = detail ] || [ "$log_failure" = 1 ]; then
+				message=$(head -c 250 "$TMP_DIR/probe-error-$$.txt" 2>/dev/null)
+				task_event WARN "$classification" "sample=$STAGE_TOTAL ip=$ip host=$host http=$code bytes=$got curl_exit=$rc connect_s=${5:-0} total_s=${6:-0} error=$message；$(probe_advice "$classification")"
+			fi
+			failure_codes="$failure_codes $classification"
+			;;
+		esac
+		TASK_PROGRESS_DONE=$STAGE_TOTAL; TASK_PROGRESS_VALID=$STAGE_VALID
+		task_snapshot 0
 	done
+	if [ -n "$failure_codes" ] && [ "$LOG_MODE" = concise ]; then
+		failure_counts=$(printf '%s\n' "$failure_codes" | awk '{for(i=1;i<=NF;i++){if(!count[$i]++) order[++n]=$i}} END{for(i=1;i<=n;i++) printf "%s%s=%d",(i>1?" ":""),order[i],count[order[i]]}')
+		task_event WARN STAGE_FAILURE_SUMMARY "$failure_counts"
+	fi
+	task_event INFO STAGE_SUMMARY "samples=$STAGE_TOTAL valid=$STAGE_VALID failed=$((STAGE_TOTAL-STAGE_VALID))"
 }
 
 verify_domains() {
-	local group=$1 ip=$2 path off d list ok=""
-	path=$(url_path "$(group_url "$group")")
+	local group=$1 ip=$2 primary url off d list ok="" defaults=""
+	primary=$(group_url "$group")
 	off=$(group_offset "$group")
-	case "$group" in cn) list=$CN_DOMAINS ;; com) list=$COM_DOMAINS ;; esac
+	list=$(configured_domains "$group")
 	for d in $list; do
-		alive "$ip" "$d" "$path" "$off" && ok="$ok $d"
+		if ! url=$(domain_url "$group" "$d" "$primary"); then
+			if [ "$group" = switch ]; then
+				case " $SWITCH_GAME_DOMAINS " in *" $d "*) defaults="$defaults $d" ;; esac
+			fi
+			continue
+		fi
+		off=$(domain_offset "$group" "$d")
+		alive_resource "$ip" "$url" "$off" "$group" && ok="$ok $d"
 	done
+	if [ "$group" = switch ]; then
+		case " $ok " in *" $(url_host "$primary") "*) ok="$ok $defaults" ;; esac
+	fi
 	echo $ok
 }
 
 test_group() {
-	local group=$1 url host path off cands count qs qb qt fs fb ft topn thr
+	local group=$1 url host path off cands count=0 qb qt fb ft topn thr
 	local q="$TMP_DIR/quick_$group" f="$TMP_DIR/full_$group"
-	local tops cur best best_ip_ best_speed cur_speed chosen chosen_speed doms
-
-	url=$(group_url "$group")
-	host=$(url_host "$url")
-	path=$(url_path "$url")
-	off=$(group_offset "$group")
-	qb=$(($(to_int "$(cfg quick_size_mb 4)") * 1048576))
-	qt=$(to_int "$(cfg quick_time 4)")
-	fb=$(($(to_int "$(cfg full_size_mb 64)") * 1048576))
-	ft=$(to_int "$(cfg full_time 10)")
-	topn=$(to_int "$(cfg top_n 3)")
-	thr=$(to_int "$(cfg switch_threshold 15)")
-	[ "$qb" -gt 0 ] && [ "$qt" -gt 0 ] && [ "$fb" -gt 0 ] && [ "$ft" -gt 0 ] && [ "$topn" -gt 0 ] ||
-		{ note "[$group] 测速参数无效，跳过"; return 1; }
-
-	say "[$group] 测速文件：$url"
-	cands=$(candidates "$group")
-	count=$(echo "$cands" | grep -c .)
-	[ "$count" -gt 0 ] || { note "[$group] 没有找到候选节点，保留现有配置"; return 1; }
-	passwall_direct $cands
-
+	local tops cur best best_ip_ best_speed cur_speed chosen chosen_speed doms d resource missing=""
+	local PROBE_SCHEME PROBE_UA
+	TEST_GROUP_PARTIAL=0
+	group_report "$group" running RESOURCE_PREPARING '正在准备测速资源'
+	task_stage "resource_$group"
+	if ! prepare_group_resource "$group"; then
+		group_report "$group" failed "$GROUP_RESOURCE_CODE" "$GROUP_RESOURCE_MESSAGE"
+		task_event ERROR "$GROUP_RESOURCE_CODE" "group=$group $GROUP_RESOURCE_MESSAGE"
+		return 1
+	fi
+	url=$(group_url "$group"); host=$(url_host "$url"); path=$(url_path "$url"); off=$(group_offset "$group")
+	PROBE_SCHEME=$(url_scheme "$url"); PROBE_UA=$(group_user_agent "$group")
+	qb=$(($(to_int "$(cfg quick_size_mb 4)") * 1048576)); qt=$(to_int "$(cfg quick_time 4)")
+	fb=$(($(to_int "$(cfg full_size_mb 64)") * 1048576)); ft=$(to_int "$(cfg full_time 10)")
+	topn=$(to_int "$(cfg top_n 3)"); thr=$(to_int "$(cfg switch_threshold 15)")
+	group_report "$group" running DISCOVERING '正在发现候选节点'
+	task_stage "discover_$group"
+	say "[$group] 测速文件：$(safe_text "$url")"
+	cands=$(candidates "$group"); count=$(echo "$cands" | grep -c .)
+	if [ "$count" -eq 0 ]; then
+		group_report "$group" failed NO_CANDIDATES '没有候选节点；检查 DNS/HTTPDNS 查询日志，旧配置未替换'
+		task_event ERROR NO_CANDIDATES "group=$group"
+		return 1
+	fi
+	[ "${TEST_MODE:-apply}" = measure ] || passwall_direct $cands
+	task_stage "quick_$group"
 	say "[$group] 初筛 $count 个候选（每个最多 $(cfg quick_size_mb 4) MB / ${qt} 秒）"
 	stage_run "$q" 131072 "$qb" "$qt" "$host" "$path" "$off" $cands
-	[ -s "$q" ] || { note "[$group] 所有候选都不可用，保留现有配置"; return 1; }
-
+	if [ ! -s "$q" ]; then
+		group_report "$group" failed QUICK_TEST_FAILED "初筛没有有效样本；最后原因=$STAGE_LAST_CODE；旧配置保留" "" 0 "$count" "$STAGE_VALID"
+		return 1
+	fi
 	cur=$(best_ip "$group")
 	tops=$(sort -rn "$q" | head -n "$topn" | awk '{print $2}')
-	# 当前节点仍可用时一定参加复测，否则无法判断是否值得切换
-	if [ -n "$cur" ] && grep -q " $cur\$" "$q" && ! echo "$tops" | grep -qxF "$cur"; then
-		tops="$tops $cur"
-	fi
-
+	if [ -n "$cur" ] && grep -q " $cur\$" "$q" && ! echo "$tops" | grep -qxF "$cur"; then tops="$tops $cur"; fi
+	task_stage "full_$group"
 	say "[$group] 复测（每个最多 $(cfg full_size_mb 64) MB / ${ft} 秒）"
 	stage_run "$f" 1048576 "$fb" "$ft" "$host" "$path" "$off" $tops
-	[ -s "$f" ] || { note "[$group] 复测全部失败，保留现有配置"; return 1; }
-
-	best=$(sort -rn "$f" | head -n 1)
-	best_speed=${best%% *}
-	best_ip_=${best##* }
-	chosen=$best_ip_
-	chosen_speed=$best_speed
-	cur_speed=""
+	if [ ! -s "$f" ]; then
+		group_report "$group" failed FULL_TEST_FAILED "复测没有有效样本；最后原因=$STAGE_LAST_CODE；旧配置保留" "" 0 "$count" "$STAGE_VALID"
+		return 1
+	fi
+	best=$(sort -rn "$f" | head -n 1); best_speed=${best%% *}; best_ip_=${best##* }
+	chosen=$best_ip_; chosen_speed=$best_speed; cur_speed=""
 	[ -n "$cur" ] && cur_speed=$(awk -v ip="$cur" '$2==ip{print $1; exit}' "$f")
-	# 新节点没有明显更快就不切换，避免来回抖动
-	if [ -n "$cur_speed" ] && [ "$cur" != "$best_ip_" ] &&
-		[ $((best_speed * 100)) -le $((cur_speed * (100 + thr))) ]; then
-		chosen=$cur
-		chosen_speed=$cur_speed
+	if [ "${TEST_MODE:-apply}" != measure ] && [ -n "$cur_speed" ] && [ "$cur" != "$best_ip_" ] && [ $((best_speed * 100)) -le $((cur_speed * (100 + thr))) ]; then
+		chosen=$cur; chosen_speed=$cur_speed
 		say "[$group] 最快节点 $best_ip_ 未超过当前节点 ${thr}%，保持 $cur"
 	fi
-
-	mkdir -p "$STATE_DIR"
-	if [ "$chosen" != "$cur" ] || [ ! -s "$STATE_DIR/domains_$group" ]; then
-		doms=$(verify_domains "$group" "$chosen")
-		[ -n "$doms" ] || { note "[$group] 节点 $chosen 未通过域名校验，保留现有配置"; return 1; }
-		echo "$doms" >"$STATE_DIR/domains_$group"
-		echo "$chosen" >"$STATE_DIR/best_$group"
-		note "[$group] 选用节点 $chosen，$(fmt_speed "$chosen_speed")${cur:+（原节点 $cur）}"
-	else
-		say "[$group] 节点不变：$chosen，$(fmt_speed "$chosen_speed")"
+	task_stage "domains_$group"
+	doms=$(verify_domains "$group" "$chosen")
+	if ! printf '%s\n' $doms | grep -qxF "$host"; then
+		group_report "$group" failed PRIMARY_DOMAIN_FAILED '选中节点未通过主下载域名资源校验；旧配置保留' "" 0 "$count" "$STAGE_VALID"
+		return 1
 	fi
-	echo "$chosen $chosen_speed $(date +%s)" >"$TMP_DIR/last_$group"
+	if [ "${TEST_MODE:-apply}" != measure ] && ! commit_group_result "$group" "$chosen" "$doms"; then
+		group_report "$group" failed STATE_COMMIT_FAILED '节点状态提交失败，已恢复原分组结果；检查存储空间与权限' "" 0 "$count" "$STAGE_VALID"
+		return 1
+	fi
+	if [ "${TEST_MODE:-apply}" != measure ]; then
+		printf '%s %s %s\n' "$chosen" "$chosen_speed" "$(date +%s)" >"$TMP_DIR/last_$group"
+	fi
+	for d in $(configured_domains "$group"); do
+		resource=$(domain_url "$group" "$d" "$url") || continue
+		printf '%s\n' $doms | grep -qxF "$d" || missing="$missing $d"
+	done
+	if [ -n "$missing" ]; then
+		TEST_GROUP_PARTIAL=1
+		group_report "$group" partial PARTIAL_COVERAGE "主资源采样通过；接管域名=$doms；保持默认解析的域名=$missing" "$chosen" "$chosen_speed" "$count" "$STAGE_VALID"
+	else
+		group_report "$group" success SELECTED "主资源采样通过；已准备接管域名=$doms；尚需应用后验收" "$chosen" "$chosen_speed" "$count" "$STAGE_VALID"
+	fi
+	if [ "${TEST_MODE:-apply}" = measure ]; then
+		if ! save_measurement "$group" "$chosen" "$chosen_speed" "$doms" "$count" "$STAGE_VALID" "$TEST_GROUP_PARTIAL"; then
+			group_report "$group" failed MEASUREMENT_SAVE_FAILED '测速结果保存失败，请检查存储空间'
+			return 1
+		fi
+		group_report "$group" "$([ "$TEST_GROUP_PARTIAL" = 1 ] && echo partial || echo success)" MEASUREMENT_READY '测速结果已保存，可在结果中选择采用' "$chosen" "$chosen_speed" "$count" "$STAGE_VALID"
+		task_event INFO MEASUREMENT_READY "group=$group measured_ip=$chosen speed=$(fmt_speed "$chosen_speed")"
+	else
+		task_event INFO NODE_SELECTED "group=$group old_ip=${cur:--} selected_ip=$chosen speed=$(fmt_speed "$chosen_speed") domains=$doms"
+	fi
 	return 0
 }
 
 groups_enabled() {
+	local g
 	cfg_bool optimize_cn 1 && echo cn
 	cfg_bool optimize_com 1 && echo com
+	for g in $PLATFORM_GROUPS; do cfg_bool "optimize_$g" 0 && echo "$g"; done
+	return 0
 }
 
 # ---------- 互斥锁与后台任务 ----------
@@ -475,8 +636,8 @@ lock() {
 	flock -n 8 || die "已有测速或健康检查正在运行"
 	echo $$ >"$RUN_DIR/task.pid"
 	LOG_ACTIVE=1
-	trap 'rotate_log; rm -f "$RUN_DIR/task.pid"; rm -rf "$TMP_DIR"/discover.*' EXIT
-	trap 'note "任务被停止"; exit 130' INT TERM
+	trap 'task_exit_rc=$?; measurement_cleanup || task_exit_rc=1; task_on_exit "$task_exit_rc"; rm -f "$RUN_DIR/task.pid"; rm -rf "$TMP_DIR"/discover.*; rm -f "$TMP_DIR/probe-error-$$.txt"' EXIT
+	trap 'TASK_STATUS=cancelled; TASK_CODE=CANCELLED; TASK_MESSAGE=任务被用户或服务停止; exit 130' INT TERM
 }
 
 # 对系统配置的改动（主 dnsmasq 规则、uhttpd、cron）串行执行
@@ -493,8 +654,12 @@ apply_lock() {
 
 # 后台任务交给 procd 运行，不依赖浏览器页面或 SSH 会话
 start_task() {
-	local kind=${1:-all}
-	case "$kind" in all | cn | com) ;; *) die "未知任务：$kind" ;; esac
+	local kind=${1:-all} trigger=${2:-manual_cli} selection=${3:-} result_id=${4:-}
+	case "$kind" in all | cn | com | store | ps | xbox_old | switch | apply | restart | verify | report | measure | adopt) ;; *) die "未知任务：$kind" ;; esac
+	case "$kind" in
+	measure) measurement_groups "${selection:-all}" >/dev/null || die '请选择有效的测速平台' ;;
+	adopt) group_valid "$selection" || die '采用结果的平台无效'; printf '%s\n' "$result_id" | grep -qE '^[0-9]{8}T[0-9]{6}-[0-9]+$' || die '请选择当前测速结果' ;;
+	esac
 	mkdir -p "$RUN_DIR"
 	exec 9>"$RUN_DIR/launch.lock"
 	flock -n 9 || die "另一个任务正在启动"
@@ -504,15 +669,25 @@ start_task() {
 	rm -f "$RUN_DIR/task.pid"
 	# procd 不会重新启动已经退出、参数又没有变化的实例，先移除旧实例
 	ubus call service delete '{"name":"xbox-accel-task"}' >/dev/null 2>&1
+	if [ "$kind" = report ]; then
+		mkdir -p "$TMP_DIR"
+		last_task_document >"$TMP_DIR/export-target-task.json"
+	fi
+	case "$kind" in all|cn|com|store|ps|xbox_old|switch) task_prepare "" test "$trigger" || true ;; *) task_prepare "" "$kind" "$trigger" || true ;; esac
+	[ "$TASK_MEMORY_READY" = 1 ] || die "无法记录任务状态，已取消启动；检查 /tmp 可写性和空间"
 	initscript=/usr/bin/xbox-accel
 	service_triggers() { :; }
 	. /lib/functions/procd.sh
 	procd_open_service xbox-accel-task /usr/bin/xbox-accel
 	procd_open_instance worker
-	procd_set_param command /usr/bin/xbox-accel _worker "$kind"
+	procd_set_param command /usr/bin/xbox-accel _worker "$kind" "$trigger" "$TASK_ID" "$selection" "$result_id"
 	procd_set_param env PATH="$PATH"
+	procd_set_param stderr 1
 	procd_close_instance
-	procd_close_service
+	if ! procd_close_service; then
+		TASK_STATUS=failed; TASK_CODE=START_FAILED; TASK_MESSAGE=procd任务注册失败; TASK_FINISHED=$(date +%s); task_snapshot 1; return 1
+	fi
+	printf '任务已受理：%s。尚未完成，请等待任务摘要。\n' "$TASK_ID"
 }
 
 ppid_of() { sed -n 's/^[0-9]* (.*) [A-Za-z] \([0-9]*\) .*/\1/p' "/proc/$1/stat" 2>/dev/null; }
@@ -526,10 +701,52 @@ children_of() {
 
 # 只终止确认属于该任务的进程及其子进程，不按名字批量杀 curl
 kill_tree() {
-	local c
-	for c in $(children_of "$1"); do kill_tree "$c"; done
-	kill -TERM "$1" 2>/dev/null
+	local c signal=${2:-TERM}
+	for c in $(children_of "$1"); do kill_tree "$c" "$signal"; done
+	kill -"$signal" "$1" 2>/dev/null
 	return 0
+}
+
+# 从 rc.common 外层限制整个服务操作，覆盖它在加载阶段获取服务锁的等待。
+run_service_action() {
+	local action=${1:-help} limit worker watchdog timer marker result
+	[ "$#" -eq 0 ] || shift
+	case "$action" in
+	stop|shutdown|disable) limit=60 ;;
+	start|restart|reload|boot) limit=120 ;;
+	enable|enabled|running|status|info|help) limit=15 ;;
+	*) echo "错误：[SERVICE_ACTION_INVALID] 未知服务操作：$action" >&2; return 1 ;;
+	esac
+	limit=${XBOX_ACCEL_SERVICE_TIMEOUT:-$limit}
+	case "$limit" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$limit" -ge 1 ] && [ "$limit" -le 300 ] || return 1
+	mkdir -p "$RUN_DIR" || return 1
+	marker=$(mktemp "$RUN_DIR/service-timeout.XXXXXX") || return 1
+	/bin/sh /etc/rc.common "$INIT" "$action" "$@" &
+	worker=$!
+	(
+		close_service_fds
+		sleep "$limit" & timer=$!
+		trap 'kill "$timer" 2>/dev/null; exit 0' INT TERM
+		wait "$timer"
+		printf 'timeout\n' >"$marker"
+		echo "错误：[SERVICE_TIMEOUT] $action 超过 ${limit} 秒；正在终止等待的服务操作，清理记录保留" >&2
+		kill_tree "$worker"
+		sleep 1
+		kill_tree "$worker" KILL
+	) &
+	watchdog=$!
+	wait "$worker"; result=$?
+	# 超时时由 watchdog 完成整个子树的终止；正常退出时清理计时进程。
+	if [ -s "$marker" ]; then
+		wait "$watchdog" 2>/dev/null
+		result=124
+	else
+		kill -TERM "$watchdog" 2>/dev/null
+		wait "$watchdog" 2>/dev/null
+	fi
+	rm -f "$marker"
+	return "$result"
 }
 
 is_ancestor() {
@@ -542,13 +759,25 @@ is_ancestor() {
 }
 
 cancel_task() {
-	local pid
+	local pid attempt
 	pid=$(cat "$RUN_DIR/task.pid" 2>/dev/null)
 	# 任务自己触发的重载不能反过来杀掉任务
 	[ -n "$pid" ] && is_ancestor "$pid" && return 0
-	process_matches "$pid" xbox-accel && kill_tree "$pid"
+	mkdir -p "$RUN_DIR"
+	exec 9>"$RUN_DIR/launch.lock"
+	flock -n 9 || { say '任务正在启动，请稍后取消'; return 1; }
+	if process_matches "$pid" xbox-accel; then
+		kill_tree "$pid"
+		# Let the worker persist its terminal record before procd sends another TERM.
+		for attempt in 1 2 3; do
+			process_matches "$pid" xbox-accel || break
+			sleep 1
+		done
+	fi
 	ubus call service delete '{"name":"xbox-accel-task"}' >/dev/null 2>&1
 	rm -f "$RUN_DIR/task.pid"
+	if ! process_matches "$pid" xbox-accel; then finish_cancelled_record; fi
+	flock -u 9
 	return 0
 }
 
@@ -557,6 +786,12 @@ cancel_task() {
 pin() {
 	echo "host-record=$1,$2"
 	echo "local=/$1/"
+}
+
+pin_exact() {
+	pin "$1" "$2"
+	# 子域例外保留正常上游；精确名称的 AAAA 返回正常 NODATA。
+	echo "server=/*.$1/#"
 }
 
 srv_rules() {
@@ -568,7 +803,7 @@ srv_rules() {
 }
 
 gen_resolver_conf() {
-	local s d ip target
+	local s d ip target g
 	echo "# 由 xbox-accel 生成，请勿手工修改"
 	echo "port=$(cfg resolver_port 5335)"
 	echo "listen-address=127.0.0.1"
@@ -579,6 +814,8 @@ gen_resolver_conf() {
 	echo "cache-size=0"
 	echo "local-ttl=$(to_int "$(cfg ttl 30)")"
 	echo "pid-file=$RUN_DIR/dnsmasq.pid"
+	echo 'log-queries'
+	echo "log-facility=$TMP_DIR/dns-observation.log"
 	# 没有被固定的域名照常向这些 DNS 查询
 	for s in $(cfg fallback_dns "223.5.5.5 119.29.29.29" | tr ' ' '\n' | ipv4s); do
 		echo "server=$s"
@@ -590,7 +827,7 @@ gen_resolver_conf() {
 
 	case "$(com_mode)" in
 	redirect)
-		target=$(lan_ip)
+		target=$(redirect_ip)
 		for d in $COM_DOMAINS $COM_DL_DOMAINS; do pin "$d" "$target"; done
 		cfg_bool override_cdn_hosts 1 && for d in $CDN_HOSTS; do pin "$d" "$target"; done
 		srv_rules
@@ -603,6 +840,12 @@ gen_resolver_conf() {
 		fi
 		;;
 	esac
+	# 固定精确名称并为其余子域保留上游查询。
+	for g in $PLATFORM_GROUPS; do
+		if cfg_bool "optimize_$g" 0 && ip=$(best_ip "$g"); then
+			for d in $(pinned_domains "$g"); do pin_exact "$d" "$ip"; done
+		fi
+	done
 }
 
 write_resolver_conf() {
@@ -621,6 +864,7 @@ write_resolver_conf() {
 # ---------- 主 dnsmasq 的固定规则 ----------
 
 main_domains() {
+	local g
 	cfg_bool optimize_cn 1 && echo "$CN_DOMAINS"
 	case "$(com_mode)" in
 	off) ;;
@@ -629,13 +873,15 @@ main_domains() {
 		cfg_bool override_cdn_hosts 1 && echo "$CDN_HOSTS"
 		;;
 	esac
+	for g in $PLATFORM_GROUPS; do cfg_bool "optimize_$g" 0 && pinned_domains "$g"; done
+	return 0
 }
 
 main_rules_now() {
 	uci -q get "dhcp.$DNS_INSTANCE.server" | tr ' ' '\n' | grep .
 }
 
-# sync_main 1|0：同步规则；有变化时返回 0
+# sync_main 1|0：0=有变化，1=保持原样，2=同步失败（保留所有权记录）。
 sync_main() {
 	local want=$1 port desired e changed=1 old now known
 	local DNS_INSTANCE="$DNS_INSTANCE" previous_instance
@@ -645,16 +891,18 @@ sync_main() {
 	elif [ -n "$previous_instance" ] && [ "$previous_instance" != "$DNS_INSTANCE" ]; then
 		die "修改主 dnsmasq 实例前必须先停用插件，撤销旧实例规则"
 	fi
-	uci -q get "dhcp.$DNS_INSTANCE" >/dev/null || { note "找不到 dhcp.$DNS_INSTANCE，无法写入解析规则"; return 1; }
+	uci -q get "dhcp.$DNS_INSTANCE" >/dev/null || { note "找不到 dhcp.$DNS_INSTANCE，无法写入解析规则"; return 2; }
+	mkdir -p "$STATE_DIR" || return 2
 	port=$(cfg resolver_port 5335)
 	desired=""
 	[ "$want" = 1 ] && desired=$(main_domains | tr ' ' '\n' | grep . | sed "s|.*|/&/127.0.0.1#$port|" | uniq_keep_order)
 	now=$(main_rules_now)
 	# “本插件写入的规则”= 上次记录的规则，加上配置里现存的、域名在本插件名单内
 	# 且指向本插件端口的规则（上次操作被中断时记录可能不完整）
-	known=$(for e in $CN_DOMAINS $COM_DOMAINS $COM_DL_DOMAINS $SRV_NAMES $CDN_HOSTS; do echo "/$e/127.0.0.1#$port"; done)
+	known=$(for e in $CN_DOMAINS $COM_DOMAINS $COM_DL_DOMAINS $SRV_NAMES $CDN_HOSTS $PLATFORM_DOMAINS; do echo "/$e/127.0.0.1#$port"; done)
 	old=$({
 		cat "$STATE_DIR/main_rules" 2>/dev/null
+		pending_cleanup_rules
 		for e in $now; do echo "$known" | grep -qxF "$e" && echo "$e"; done
 	} | uniq_keep_order)
 
@@ -662,13 +910,15 @@ sync_main() {
 	for e in $old; do
 		echo "$desired" | grep -qxF "$e" && continue
 		while main_rules_now | grep -qxF "$e"; do
-			uci -q del_list "dhcp.$DNS_INSTANCE.server=$e" || break
+			mark_main_reload || return 2
+			uci -q del_list "dhcp.$DNS_INSTANCE.server=$e" || return 2
 			changed=0
 		done
 	done
 	for e in $desired; do
 		echo "$now" | grep -qxF "$e" && continue
-		uci -q add_list "dhcp.$DNS_INSTANCE.server=$e"
+		mark_main_reload || return 2
+		uci -q add_list "dhcp.$DNS_INSTANCE.server=$e" || return 2
 		changed=0
 	done
 	mkdir -p "$STATE_DIR"
@@ -676,6 +926,7 @@ sync_main() {
 	# 记录本插件实际新增的条目，卸载时不删除用户原先的例外。
 	local rd desired_rd="" owned_rd remaining_rd="" existing_rd
 	owned_rd=$(cat "$STATE_DIR/rebind_domains" 2>/dev/null)
+	existing_rd=$(uci -q get "dhcp.$DNS_INSTANCE.rebind_domain")
 	if [ "$want" = 1 ] && [ "$(com_mode)" = redirect ]; then
 		desired_rd="$COM_DOMAINS $COM_DL_DOMAINS"
 		cfg_bool override_cdn_hosts 1 && desired_rd="$desired_rd $CDN_HOSTS"
@@ -684,23 +935,29 @@ sync_main() {
 		if echo " $desired_rd " | grep -qF " $rd "; then
 			remaining_rd="$remaining_rd $rd"
 		else
-			uci -q del_list "dhcp.$DNS_INSTANCE.rebind_domain=$rd" && changed=0
+			if echo " $existing_rd " | grep -qF " $rd "; then
+				mark_main_reload || return 2
+				uci -q del_list "dhcp.$DNS_INSTANCE.rebind_domain=$rd" || return 2
+				changed=0
+			fi
 		fi
 	done
 	existing_rd=$(uci -q get "dhcp.$DNS_INSTANCE.rebind_domain")
 	for rd in $desired_rd; do
 		echo " $existing_rd " | grep -qF " $rd " && continue
-		uci -q add_list "dhcp.$DNS_INSTANCE.rebind_domain=$rd" || return 1
+		mark_main_reload || return 2
+		uci -q add_list "dhcp.$DNS_INSTANCE.rebind_domain=$rd" || return 2
 		remaining_rd="$remaining_rd $rd"
 		changed=0
 	done
+	if [ "$changed" = 0 ] || [ -e "$STATE_DIR/main_reload_needed" ]; then
+		uci -q commit dhcp || return 2
+		changed=0
+	fi
 	if [ -n "$remaining_rd" ]; then
 		echo "$remaining_rd" | tr ' ' '\n' | grep . | uniq_keep_order >"$STATE_DIR/rebind_domains"
 	else
 		rm -f "$STATE_DIR/rebind_domains"
-	fi
-	if [ "$changed" = 0 ]; then
-		uci -q commit dhcp
 	fi
 	if [ -n "$desired" ]; then
 		echo "$desired" >"$STATE_DIR/main_rules"
@@ -711,187 +968,382 @@ sync_main() {
 	return $changed
 }
 
-# Passwall 默认会另起一个 dnsmasq 副本接管局域网 DNS，副本在 Passwall 启动时
-# 复制主 dnsmasq 的按域名上游规则。列出这些副本的配置文件。
+mark_main_reload() {
+	[ -e "$STATE_DIR/main_reload_needed" ] || : >"$STATE_DIR/main_reload_needed"
+}
+
+# 清理记录同时保存在持久目录和运行目录，升级时兼容旧版运行记录。
+pending_cleanup_rules() {
+	cat "$STATE_DIR/pending_rules" "$RUN_DIR/pending_rules" 2>/dev/null | uniq_keep_order
+}
+
+remember_cleanup() {
+	local rules=$1 instance=${2:-} new="$STATE_DIR/pending_rules.new.$$" copies
+	mkdir -p "$STATE_DIR" "$RUN_DIR" || return 1
+	{ pending_cleanup_rules; printf '%s\n' "$rules"; } | grep . | uniq_keep_order >"$new" || { rm -f "$new"; return 1; }
+	mv "$new" "$STATE_DIR/pending_rules" || return 1
+	cp "$STATE_DIR/pending_rules" "$RUN_DIR/pending_rules" || return 1
+	[ -z "$instance" ] || printf '%s\n' "$instance" >"$STATE_DIR/pending_instance" || return 1
+	# 规则移除后仍保留副本配置路径，用于刷新仍在运行的任意名称副本。
+	copies=$(passwall_dnsmasq_confs)
+	{ cat "$STATE_DIR/dns_copies" 2>/dev/null; printf '%s\n' "$copies"; } | grep . | uniq_keep_order >"$new" || { rm -f "$new"; return 1; }
+	mv "$new" "$STATE_DIR/dns_copies" || return 1
+	return 0
+}
+
+# 使用运行中的可执行文件身份识别 dnsmasq，包括任意改名、软链接和二进制副本。
+# cmp 同时支持已经删除或改名、仍在运行的原二进制；整个过程只读取文件。
+dnsmasq_process() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	cmp -s "/proc/$1/exe" /usr/sbin/dnsmasq
+}
+
+# 按 NUL 边界解析参数，覆盖 -C FILE、-CFILE、--conf-file FILE/FILE=。
+dnsmasq_process_confs() {
+	local pid=$1 conf base
+	tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | awk '
+		NR==1 {next}
+		nextconf {if ($0 != "") print; nextconf=0; next}
+		$0=="-C" || $0=="--conf-file" {nextconf=1; seen=1; next}
+		/^--conf-file=/ {sub(/^--conf-file=/, ""); if ($0!="") print; seen=1; next}
+		/^-C./ {sub(/^-C/, ""); print; seen=1}
+		END {if (!seen) print "/etc/dnsmasq.conf"}
+	' | while IFS= read -r conf; do
+		case "$conf" in /*) base="/proc/$pid/root" ;; *) base="/proc/$pid/cwd/" ;; esac
+		readlink -f "$base$conf" 2>/dev/null
+	done | uniq_keep_order
+}
+
+# 以已记录的规则所有权识别任意路径下的副本；Passwall 目录也参与新增规则同步。
 passwall_dnsmasq_confs() {
-	local p c
+	local p pid conf owned e recorded mains section id
+	recorded=$(cat "$STATE_DIR/dns_copies" 2>/dev/null)
+	mains=$(uci -q show dhcp 2>/dev/null | awk -F= '$2=="dnsmasq" {print $1}' | while IFS= read -r section; do
+		id=$(uci -q show "$section" 2>/dev/null | awk -F '[.=]' 'NR==1{print $2}')
+		[ -n "$id" ] && readlink -f "/var/etc/dnsmasq.conf.$id"
+	done)
+	owned=$({ cat "$STATE_DIR/main_rules" 2>/dev/null; pending_cleanup_rules;
+		for e in $CN_DOMAINS $COM_DOMAINS $COM_DL_DOMAINS $SRV_NAMES $CDN_HOSTS $PLATFORM_DOMAINS; do echo "/$e/127.0.0.1#$(cfg resolver_port 5335)"; done;
+	} | uniq_keep_order)
 	for p in /proc/[0-9]*; do
-		[ -r "$p/cmdline" ] || continue
-		c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
-		case "$c" in
-		*dnsmasq*passwall*) echo "$c" | tr ' ' '\n' | grep -A1 -x -e '-C' | tail -n 1 ;;
-		esac
+		pid=${p##*/}
+		dnsmasq_process "$pid" || continue
+		dnsmasq_process_confs "$pid" | while IFS= read -r conf; do
+			[ "$conf" = "$(readlink -f "$RESOLVER_CONF")" ] && continue
+			printf '%s\n' "$mains" | grep -qxF "$conf" && continue
+			case "$conf" in */passwall/*|*/passwall2/*) printf '%s\n' "$conf"; continue ;; esac
+			printf '%s\n' "$recorded" | grep -qxF "$conf" && { printf '%s\n' "$conf"; continue; }
+			for e in $owned; do
+				if grep -qxF "server=$e" "$conf" 2>/dev/null; then printf '%s\n' "$conf"; break; fi
+			done
+		done
 	done | grep . | uniq_keep_order
 }
 
-# 副本缺少本插件的规则时返回 0
-passwall_out_of_sync() {
-	local conf e miss=1 desired
+# 副本仍有已撤销的规则时返回 0；只匹配本插件拥有的规则。
+passwall_has_stale_rules() {
+	local stale_rules="$1" conf e miss=1 desired copies
 	desired=$(cat "$STATE_DIR/main_rules" 2>/dev/null)
-	for conf in $(passwall_dnsmasq_confs); do
-		[ -f "$conf" ] || continue
-		for e in $desired; do
-			grep -qxF "server=$e" "$conf" || miss=0
+	copies=$(passwall_dnsmasq_confs)
+	while IFS= read -r conf; do
+		[ -n "$conf" ] || continue
+		[ -r "$conf" ] || return 0
+		# 停用前保留的所有权记录也参与检查，避免修改端口后漏掉旧副本。
+		for e in $stale_rules; do
+			echo "$desired" | grep -qxF "$e" && continue
+			grep -qxF "server=$e" "$conf" && miss=0
 		done
-		# 已停用时副本里不应残留指向本插件的规则
-		for e in $(grep -E "^server=/.*/127\.0\.0\.1#$(cfg resolver_port 5335)\$" "$conf" | sed 's/^server=//'); do
-			echo "$desired" | grep -qxF "$e" || miss=0
+		# 只认本插件域名，不能把同端口的用户规则当成本插件残留。
+		for e in $CN_DOMAINS $COM_DOMAINS $COM_DL_DOMAINS $SRV_NAMES $CDN_HOSTS $PLATFORM_DOMAINS; do
+			e="/$e/127.0.0.1#$(cfg resolver_port 5335)"
+			echo "$desired" | grep -qxF "$e" && continue
+			grep -qxF "server=$e" "$conf" && miss=0
 		done
-	done
+	done <<EOF
+$copies
+EOF
 	return $miss
 }
 
-sync_passwall() {
-	passwall_out_of_sync || return 0
-	if cfg_bool passwall_restart 1 && [ -x /etc/init.d/passwall ]; then
-		note "Passwall 的 DNS 副本需要重新载入解析规则，正在重启 Passwall"
-		svc /etc/init.d/passwall restart
-		# 重启后直连集合被重建，把当前节点加回去
-		passwall_direct $(best_ip cn) $(best_ip com)
-	else
-		note "Passwall 的 DNS 副本还没有载入本插件的规则，请手动重启 Passwall"
-	fi
+passwall_out_of_sync() {
+	local conf e desired copies
+	passwall_has_stale_rules "$1" && return 0
+	desired=$(cat "$STATE_DIR/main_rules" 2>/dev/null)
+	copies=$(passwall_dnsmasq_confs)
+	while IFS= read -r conf; do
+		[ -n "$conf" ] || continue
+		[ -r "$conf" ] || return 0
+		for e in $desired; do
+			grep -qxF "server=$e" "$conf" || return 0
+		done
+	done <<EOF
+$copies
+EOF
+	return 1
 }
 
-# ---------- uhttpd 的 302 入口 ----------
+sync_passwall() {
+	local stale_rules="$1" cleanup=0 services service conf copies
+	passwall_out_of_sync "$stale_rules" || return 0
+	passwall_has_stale_rules "$stale_rules" && cleanup=1
+	# 撤销功能时始终重新载入副本，确保用户关闭后立即恢复原解析。
+	# passwall_restart 仅控制启用时新增规则的自动同步。
+	if [ "$cleanup" = 1 ] || cfg_bool passwall_restart 1; then
+		copies=$(passwall_dnsmasq_confs)
+		services=$(printf '%s\n' "$copies" | awk 'NF {if (index($0,"/passwall2/")) print "passwall2"; else print "passwall"}' | uniq_keep_order)
+		for service in ${services:-passwall}; do
+			service="/etc/init.d/$service"
+			[ -x "$service" ] || { note "DNS 副本重载入口缺失：$service；保留清理记录"; return 1; }
+			note "DNS 副本需要重新载入解析规则：$service"
+			svc "$service" restart || { note "DNS 副本重载失败：$service；保留清理记录"; return 1; }
+		done
+		# 重启后直连集合被重建，把当前节点加回去
+		[ -s "$STATE_DIR/main_rules" ] && passwall_direct $(selected_ips)
+		if passwall_out_of_sync "$stale_rules"; then
+			note "Passwall 的 DNS 副本仍有规则不同步，请检查 Passwall 重载日志"
+			return 1
+		fi
+	else
+		note "Passwall 的 DNS 副本规则待同步，请重载 Passwall"
+		[ "$cleanup" = 1 ] && return 1
+	fi
+	return 0
+}
+
+# ---------- 旧版主 uhttpd 配置的迁移清理 ----------
 
 sync_uhttpd() {
-	local want=$1 cur
-	uci -q get uhttpd.main >/dev/null || return 0
+	local cur
+	uci -q get uhttpd.main >/dev/null || {
+		[ ! -e "$STATE_DIR/uhttpd_pending" ] && [ ! -e "$STATE_DIR/uhttpd_error_page" ]
+		return $?
+	}
 	cur=$(uci -q get uhttpd.main.error_page)
-	if [ "$want" = 1 ]; then
-		[ "$cur" = "$CGI_URL" ] && return 0
-		mkdir -p "$STATE_DIR"
-		[ -n "$cur" ] && echo "$cur" >"$STATE_DIR/uhttpd_error_page"
-		uci -q set "uhttpd.main.error_page=$CGI_URL"
-	else
-		[ "$cur" = "$CGI_URL" ] || return 0
+	[ "$cur" = "$CGI_URL" ] || [ -e "$STATE_DIR/uhttpd_pending" ] || [ -e "$STATE_DIR/uhttpd_error_page" ] || return 0
+	mkdir -p "$STATE_DIR" || return 1
+	: >"$STATE_DIR/uhttpd_pending" || return 1
+	if [ "$cur" = "$CGI_URL" ]; then
 		if [ -s "$STATE_DIR/uhttpd_error_page" ]; then
-			uci -q set "uhttpd.main.error_page=$(cat "$STATE_DIR/uhttpd_error_page")"
+			uci -q set "uhttpd.main.error_page=$(cat "$STATE_DIR/uhttpd_error_page")" || return 1
 		else
-			uci -q delete uhttpd.main.error_page
+			uci -q delete uhttpd.main.error_page || return 1
 		fi
-		rm -f "$STATE_DIR/uhttpd_error_page"
 	fi
-	uci -q commit uhttpd
-	svc /etc/init.d/uhttpd restart
+	uci -q commit uhttpd || return 1
+	svc /etc/init.d/uhttpd restart || return 1
+	rm -f "$STATE_DIR/uhttpd_pending" "$STATE_DIR/uhttpd_error_page"
+	return 0
 }
 
 # ---------- 定时任务 ----------
 
 sync_cron() {
-	local want=$1 new="$TMP_DIR/cron.new" sched hi
-	mkdir -p "$TMP_DIR" "${CRON_FILE%/*}"
-	touch "$CRON_FILE"
+	local want=$1 new="$TMP_DIR/cron.new" sched hi rc
+	mkdir -p "$TMP_DIR" "$STATE_DIR" "${CRON_FILE%/*}" || return 1
+	touch "$CRON_FILE" || return 1
 	grep -vF "$CRON_TAG" "$CRON_FILE" >"$new"
+	rc=$?; [ "$rc" -le 1 ] || return 1
 	if [ "$want" = 1 ]; then
-		sched=$(cfg cron "15 5 * * *")
-		[ -n "$sched" ] && echo "$sched /usr/bin/xbox-accel start_test >/dev/null 2>&1 $CRON_TAG" >>"$new"
+		sched=$(schedule_cron) || die "定时测速计划无效"
+		[ -n "$sched" ] && echo "$sched /usr/bin/xbox-accel start_test all scheduled >/dev/null 2>&1 $CRON_TAG" >>"$new"
 		hi=$(to_int "$(cfg health_interval 10)")
 		[ "$hi" -gt 0 ] && [ "$hi" -lt 60 ] &&
 			echo "*/$hi * * * * /usr/bin/xbox-accel health >/dev/null 2>&1 $CRON_TAG" >>"$new"
 	fi
 	if cmp -s "$new" "$CRON_FILE"; then
 		rm -f "$new"
-		return 0
+		[ -e "$STATE_DIR/cron_reload_needed" ] || return 0
+	else
+		: >"$STATE_DIR/cron_reload_needed" || return 1
+		cat "$new" >"$CRON_FILE" || return 1
+		rm -f "$new"
 	fi
-	cat "$new" >"$CRON_FILE"
-	rm -f "$new"
-	svc /etc/init.d/cron enable
-	svc /etc/init.d/cron restart
+	svc /etc/init.d/cron enable || return 1
+	svc /etc/init.d/cron restart || return 1
+	rm -f "$STATE_DIR/cron_reload_needed"
+	return 0
 }
 
 # ---------- 由 init 脚本调用 ----------
 
 # 当前真正生效的分组：国内优选；国际域名处于优选模式时的国际优选
 groups_active() {
+	local g
 	cfg_bool optimize_cn 1 && echo cn
 	[ "$(com_mode)" = optimize ] && echo com
+	for g in $PLATFORM_GROUPS; do cfg_bool "optimize_$g" 0 && echo "$g"; done
 	return 0
 }
 
 setup() {
-	local why
+	local why previous_rules main_rc
 	validate_config
 	apply_lock
+	migrate_redirect_ip || return 1
+	sync_uhttpd 0 || return 1
+	previous_rules=$(cat "$STATE_DIR/main_rules" 2>/dev/null)
+	# 保存旧端口与被关闭的分组规则，直到运行中的副本已完成重载。
+	if [ -n "$previous_rules" ]; then
+		remember_cleanup "$previous_rules" "$(cat "$STATE_DIR/main_instance" 2>/dev/null)" || return 1
+	fi
 	if cfg_bool redirect_cn 0; then
 		why=$(redirect_blocker)
-		[ -n "$why" ] && note "com→cn 重定向无法启用：$why；国际域名改按“国际 CDN 优选”的设置处理"
+		[ -z "$why" ] || { note "独立重定向服务准备失败：$why"; return 1; }
 	fi
+	if [ "$(com_mode)" = redirect ]; then sync_redirect 1; else sync_redirect 0; fi || return 1
 	write_resolver_conf
-	if sync_main 1; then
-		svc /etc/init.d/dnsmasq restart
-	fi
-	if [ "$(com_mode)" = redirect ]; then sync_uhttpd 1; else sync_uhttpd 0; fi
-	sync_cron 1
-	passwall_direct $(best_ip cn) $(best_ip com)
+	sync_main 1; main_rc=$?
+	case "$main_rc" in 0) svc /etc/init.d/dnsmasq restart || return 1; rm -f "$STATE_DIR/main_reload_needed" ;; 1) ;; *) return 1 ;; esac
+	sync_cron 1 || return 1
+	passwall_direct $(selected_ips)
 	com_mode >"$RUN_DIR/applied_mode"
+	groups_active >"$RUN_DIR/applied_groups"
 	return 0
 }
 
 # 解析实例就绪后再检查 Passwall，避免它重启时规则指向一个还没起来的端口
 post_start() {
-	local g missing=1
+	local g attempt missing=1
 	apply_lock
-	sync_passwall
-	if [ -f "$RUN_DIR/cache_flush_needed" ]; then
-		flush_front_cache
+	if [ "$(cat "$RUN_DIR/applied_mode" 2>/dev/null)" = redirect ]; then
+		for attempt in 1 2 3 4 5; do
+			redirect_ready && redirect_firewall_ready && break
+			sleep 1
+		done
+		redirect_ready && redirect_firewall_ready || { note '独立重定向监听或转发规则尚未就绪'; return 1; }
+		redirect_pids | head -n 1 >"$RUN_DIR/redirect.pid"
+	fi
+	sync_passwall "$(pending_cleanup_rules)" || return 1
+	if [ "$(cat "$RUN_DIR/applied_mode" 2>/dev/null)" = redirect ]; then redirect_firewall_ready || sync_redirect 1 || return 1; fi
+	if [ -f "$RUN_DIR/cache_flush_needed" ] || [ -s "$STATE_DIR/pending_rules" ] || [ -s "$RUN_DIR/pending_rules" ]; then
+		flush_front_cache || return 1
 		rm -f "$RUN_DIR/cache_flush_needed"
 	fi
+	rm -f "$STATE_DIR/pending_rules" "$STATE_DIR/pending_instance" "$RUN_DIR/pending_rules" "$STATE_DIR/dns_copies"
 	# 启用后还没有测速结果时立即测一次，不必等到定时任务
 	for g in $(groups_active); do
-		best_ip "$g" >/dev/null || missing=0
+		group_result_ready "$g" || missing=0
 	done
 	if [ "$missing" = 0 ] && ! task_running; then
-		(start_task all) >/dev/null 2>&1 7>&-
+		(start_task all first_run) >/dev/null 2>&1 7>&-
 	fi
 	return 0
 }
 
 teardown() {
+	local cleanup_instance stale_rules result=0 main_rc
 	apply_lock
 	cancel_task
-	if sync_main 0; then
-		svc /etc/init.d/dnsmasq restart
+	# sync_main 会移除状态文件；提前记住旧实例和旧端口的规则。
+	cleanup_instance=$(cat "$STATE_DIR/main_instance" 2>/dev/null)
+	[ -n "$cleanup_instance" ] || cleanup_instance=$(cat "$STATE_DIR/pending_instance" 2>/dev/null)
+	stale_rules=$({ cat "$STATE_DIR/main_rules" 2>/dev/null; pending_cleanup_rules; } | uniq_keep_order)
+	# 清理失败时保留所有权记录，重复停用仍可追踪旧端口的规则。
+	if [ -n "$stale_rules" ]; then remember_cleanup "$stale_rules" "$cleanup_instance" || return 1; fi
+	sync_main 0; main_rc=$?
+	case "$main_rc" in
+	0) if svc /etc/init.d/dnsmasq restart; then rm -f "$STATE_DIR/main_reload_needed"; else result=1; fi ;;
+	1) ;; *) result=1 ;;
+	esac
+	sync_uhttpd 0 || result=1
+	sync_redirect 0 || result=1
+	sync_cron 0 || result=1
+	sync_passwall "$stale_rules" || result=1
+	# 即使规则早已移除（或重复停用），前置 DNS 仍可能缓存旧地址。
+	flush_front_cache "${cleanup_instance:-$DNS_INSTANCE}" || result=1
+	if [ "$result" = 0 ]; then
+		rm -f "$RESOLVER_CONF" "$RUN_DIR/applied_mode" "$RUN_DIR/applied_groups" "$RUN_DIR/cache_flush_needed" "$RUN_DIR/pending_rules" "$STATE_DIR/pending_rules" "$STATE_DIR/pending_instance" "$STATE_DIR/dns_copies"
 	fi
-	sync_uhttpd 0
-	sync_cron 0
-	sync_passwall
-	rm -f "$RESOLVER_CONF" "$RUN_DIR/applied_mode" "$RUN_DIR/cache_flush_needed"
-	return 0
+	return "$result"
 }
 
 is_enabled() { cfg_bool enabled 0; }
 
 apply() {
 	if is_enabled; then
-		"$INIT" reload 7>&- 8>&- 9>&-
+		apply_and_verify
 	else
+		TASK_APPLY_STATUS=skipped; TASK_APPLY_CODE=DISABLED; TASK_APPLY_MESSAGE='插件未启用，结果只保存未应用'
 		say "服务未启用：结果已保存，启用后生效"
+		return 0
 	fi
 }
 
-resolver_running() { process_matches "$(cat "$RUN_DIR/dnsmasq.pid" 2>/dev/null)" "$RESOLVER_CONF"; }
+# 依据实际二进制和完整配置路径识别实例，PID 文件仅提供状态缓存。
+resolver_process() {
+	dnsmasq_process "$1" || return 1
+	dnsmasq_process_confs "$1" | grep -qxF "$(readlink -f "$RESOLVER_CONF")"
+}
 
-# SIGHUP 只重新读 hosts/resolv 并清空缓存，不重启 DNS/DHCP 服务。
-# 只按实际进程名和完整配置路径匹配，绝不信任可能处于 PID namespace 的 PID 文件。
-flush_front_cache() {
-	local id f pid comm cmd conf match
-	id=$(uci -q show "dhcp.$DNS_INSTANCE" | awk -F '[.=]' 'NR==1{print $2}')
-	[ -n "$id" ] || return 0
-	for f in /proc/[0-9]*/comm; do
-		read -r comm <"$f" 2>/dev/null || continue
-		[ "$comm" = dnsmasq ] || continue
-		pid=${f#/proc/}; pid=${pid%/comm}
-		cmd=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null)
-		match=0
-		printf '%s\n' "$cmd" | grep -qxF "/var/etc/dnsmasq.conf.$id" && match=1
-		for conf in $(passwall_dnsmasq_confs); do
-			printf '%s\n' "$cmd" | grep -qxF "$conf" && match=1
-		done
-		[ "$match" = 1 ] && kill -HUP "$pid" 2>/dev/null
+resolver_pids() {
+	local process pid
+	for process in /proc/[0-9]*; do
+		pid=${process##*/}
+		resolver_process "$pid" && echo "$pid"
 	done
 	return 0
+}
+
+resolver_running() {
+	[ -n "$(resolver_pids)" ]
+}
+
+# procd 停止后查验实际进程，兼容注册信息或 PID 文件遗失的情况。
+stop_resolver() {
+	local pid before after attempt signal
+	for signal in TERM KILL; do
+		for pid in $(resolver_pids); do
+			[ "$pid" -gt 1 ] || continue
+			before=$(sed 's/^[0-9]* (.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+			resolver_process "$pid" || continue
+			after=$(sed 's/^[0-9]* (.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+			[ -n "$before" ] && [ "$before" = "$after" ] || continue
+			kill -"$signal" "$pid" 2>/dev/null
+		done
+		for attempt in 1 2 3 4 5; do
+			if ! resolver_running; then
+				[ -z "$RUN_DIR" ] || rm -f "$RUN_DIR/dnsmasq.pid"
+				return 0
+			fi
+			sleep 1
+		done
+	done
+	note "[SERVICE_STOP_INCOMPLETE] 插件解析进程仍在运行，请检查进程状态"
+	return 1
+}
+
+# SIGHUP 只重新读 hosts/resolv 并清空缓存，不重启 DNS/DHCP 服务。
+# 按实际可执行文件和完整配置路径匹配，PID 文件仅作为服务状态信息。
+flush_front_cache() {
+	local instance="${1:-$DNS_INSTANCE}" id f pid conf confs match copies main result=0 start before
+	id=$(uci -q show "dhcp.$instance" | awk -F '[.=]' 'NR==1{print $2}')
+	# 主实例被删也必须清空实际运行的 Passwall 副本缓存。
+	copies=$(passwall_dnsmasq_confs)
+	main=$(readlink -f "/var/etc/dnsmasq.conf.$id")
+	for f in /proc/[0-9]*; do
+		pid=${f##*/}
+		dnsmasq_process "$pid" || continue
+		before=$(cat "$f/stat" 2>/dev/null) || continue
+		match=0
+		confs=$(dnsmasq_process_confs "$pid")
+		[ -n "$id" ] && printf '%s\n' "$confs" | grep -qxF "$main" && match=1
+		while IFS= read -r conf; do
+			[ -n "$conf" ] || continue
+			printf '%s\n' "$confs" | grep -qxF "$(readlink -f "$conf")" && match=1
+		done <<EOF
+$copies
+EOF
+		[ "$match" = 1 ] || continue
+		# stat 的启动时间可识别 PID 重用；发信号前重新核对进程身份与参数。
+		start=$(printf '%s\n' "$before" | sed 's/^[0-9]* (.*) //' | awk '{print $20}')
+		[ "$start" = "$(sed 's/^[0-9]* (.*) //' "$f/stat" 2>/dev/null | awk '{print $20}')" ] && dnsmasq_process "$pid" || continue
+		[ "$confs" = "$(dnsmasq_process_confs "$pid")" ] || continue
+		if ! kill -HUP "$pid" 2>/dev/null && [ -d "$f" ]; then
+			note "DNS 缓存清理失败：PID=$pid；保留记录供重试"
+			result=1
+		fi
+	done
+	return "$result"
 }
 
 # 已应用的状态与当前应有的状态不一致时返回 0：解析实例退出、主 dnsmasq 里的规则
@@ -900,6 +1352,13 @@ drifted() {
 	local e now
 	resolver_running || return 0
 	[ "$(cat "$RUN_DIR/applied_mode" 2>/dev/null)" = "$(com_mode)" ] || return 0
+	[ "$(cat "$RUN_DIR/applied_groups" 2>/dev/null)" = "$(groups_active)" ] || return 0
+	if [ "$(com_mode)" = redirect ]; then
+		redirect_ready && redirect_firewall_ready || return 0
+	else
+		redirect_running && return 0
+		redirect_firewall_present && return 0
+	fi
 	now=$(main_rules_now)
 	for e in $(cat "$STATE_DIR/main_rules" 2>/dev/null); do
 		echo "$now" | grep -qxF "$e" || return 0
@@ -927,10 +1386,11 @@ expected_ip() {
 	cn) cfg_bool optimize_cn 1 && best_domains cn | grep -qw assets1.xboxlive.cn && best_ip cn ;;
 	com)
 		case "$(com_mode)" in
-		redirect) lan_ip ;;
+		redirect) redirect_ip ;;
 		optimize) best_domains com | grep -qw assets1.xboxlive.com && best_ip com ;;
 		esac
 		;;
+	store|ps|xbox_old|switch) cfg_bool "optimize_$1" 0 && [ -n "$(pinned_domains "$1")" ] && best_ip "$1" ;;
 	esac
 }
 
@@ -970,23 +1430,71 @@ in_passwall_direct() {
 
 json_status() {
 	. /usr/share/libubox/jshn.sh
-	local g last
+	local g last d configured verified game_status mapped defaults total domains
 	json_init
 	json_add_string version "$VERSION"
+	json_add_string log_mode "$LOG_MODE"
+	json_add_string resolver_port "$(cfg resolver_port 5335)"
 	if is_enabled; then json_add_boolean enabled 1; else json_add_boolean enabled 0; fi
 	if resolver_running; then json_add_boolean running 1; else json_add_boolean running 0; fi
 	if task_running; then json_add_boolean testing 1; else json_add_boolean testing 0; fi
 	json_add_string mode "$(com_mode)"
 	if cfg_bool optimize_cn 1; then json_add_boolean optimize_cn 1; else json_add_boolean optimize_cn 0; fi
 	json_add_string lan_ip "$(lan_ip)"
-	for g in cn com; do
+	json_add_string redirect_ip "$(redirect_ip)"
+	json_add_string redirect_port "$(redirect_port)"
+	if redirect_running; then
+		json_add_boolean redirect_running 1
+		if redirect_ready; then json_add_boolean redirect_ready 1; else json_add_boolean redirect_ready 0; fi
+	else json_add_boolean redirect_running 0; json_add_boolean redirect_ready 0; fi
+	for g in $ALL_GROUPS; do
 		json_add_string "${g}_ip" "$(best_ip "$g")"
 		last=$(cat "$TMP_DIR/last_$g" 2>/dev/null)
 		set -- $last
 		json_add_string "${g}_speed" "${2:+$(fmt_speed "$2")}"
 		json_add_int "${g}_time" "$(to_int "$3")"
 	done
-	json_add_string log "$(tail -n 300 "$LOG_FILE" 2>/dev/null)"
+	json_add_object platforms
+	for g in $PLATFORM_GROUPS; do
+		json_add_object "$g"
+		json_add_string label "$(group_label "$g")"
+		if cfg_bool "optimize_$g" 0; then json_add_boolean enabled 1; else json_add_boolean enabled 0; fi
+		json_add_string ip "$(best_ip "$g")"
+		last=$(cat "$TMP_DIR/last_$g" 2>/dev/null); set -- $last
+		json_add_string speed "${2:+$(fmt_speed "$2")}"; json_add_int time "$(to_int "$3")"
+		domains=$(pinned_domains "$g" | tr '\n' ' ' | sed 's/ *$//')
+		json_add_string domains "$domains"
+		if [ "$g" = store ]; then json_add_int resource_expires_at "$(to_int "$(store_url_expiry "$(group_url store)")")"; fi
+		if [ "$g" = switch ]; then
+			configured=0; verified=0; mapped=0; defaults=0; total=0
+			for d in $SWITCH_GAME_DOMAINS; do
+				total=$((total+1))
+				if domain_url switch "$d" >/dev/null; then configured=$((configured+1)); fi
+				case " $domains " in *" $d "*)
+					mapped=$((mapped+1))
+					if domain_url switch "$d" >/dev/null; then verified=$((verified+1)); else defaults=$((defaults+1)); fi ;;
+				esac
+			done
+			game_status=pending; [ "$configured" = 0 ] && game_status=default
+			[ "$configured" -gt 0 ] && [ "$verified" = "$configured" ] && game_status=verified
+			json_add_string game_status "$game_status"
+			json_add_int game_configured "$configured"; json_add_int game_verified "$verified"
+			json_add_int game_mapped "$mapped"; json_add_int game_default_mapped "$defaults"; json_add_int game_total "$total"
+		fi
+		json_close_object
+	done
+	json_close_object
+	json_add_string log "$(display_log)"
+	if [ -s "$LOG_FILE" ]; then json_add_string log_source live;
+	elif [ -s "$STATE_DIR/activity-last.log" ]; then json_add_string log_source persisted;
+	else json_add_string log_source none; fi
+	json_append_document last_task "$(last_task_document)" 1
+	json_append_document last_test "$(last_speed_document)" 1
+	append_measurements
+	append_application_summary
+	json_append_document observation "$(observation_document)"
+	json_add_boolean report_ready "$(report_available && echo 1 || echo 0)"
+	json_add_string report_file "$REPORT_FILE"
 	json_dump
 }
 
@@ -1000,270 +1508,126 @@ env_row() { # 名称 级别（ok|info|warn|fail） 说明
 
 # 逐项检测运行环境。这里的检测都在路由器本机进行，无法代替在 Xbox 上的实际验证。
 json_env() {
-	. /usr/share/libubox/jshn.sh
-	local enabled=0 port miss t v d lv g ip got ports p conf pw n want url code why mode
-	is_enabled && enabled=1
-	port=$(cfg resolver_port 5335)
-	mode=$(com_mode)
-	json_init
-	json_add_array environment
-
-	# 系统与依赖
-	d=$(. /etc/openwrt_release 2>/dev/null && echo "$DISTRIB_DESCRIPTION，$DISTRIB_ARCH")
-	if [ -x /sbin/fw4 ]; then d="$d，防火墙 fw4（nftables）"; else d="$d，防火墙 fw3（iptables）"; fi
-	env_row "系统" info "${d:-未知}"
-	env_row "路由器当前时间" info "$(date '+%Y-%m-%d %H:%M:%S %Z')；所有时间安排以此系统时区为准"
-	miss=""
-	for t in dnsmasq curl flock nslookup uci ubus netstat; do
-		command -v "$t" >/dev/null 2>&1 || miss="$miss $t"
-	done
-	[ -f /usr/share/libubox/jshn.sh ] || miss="$miss jshn"
-	if [ -n "$miss" ]; then
-		env_row "依赖组件" fail "缺少：$miss"
-	else
-		env_row "依赖组件" ok "dnsmasq $(dnsmasq -v 2>/dev/null | awk 'NR==1{print $3}')，curl $(curl -V 2>/dev/null | awk 'NR==1{print $2}')"
-	fi
-
-	# 配置校验
-	v=$( (validate_config) 2>&1)
-	if [ -n "$v" ]; then
-		env_row "配置" fail "${v#错误：}。修正前服务不会载入新配置"
-	else
-		env_row "配置" ok "参数有效"
-	fi
-
-	# 主 dnsmasq
-	if [ "$(uci -q get "dhcp.$DNS_INSTANCE")" != dnsmasq ]; then
-		env_row "主 dnsmasq" fail "配置里没有 dhcp.$DNS_INSTANCE"
-	else
-		v=$(listeners_53)
-		case " $v " in
-		*" dnsmasq "*)
-			if [ "$v" = dnsmasq ]; then
-				env_row "主 dnsmasq" ok "监听 53 端口的只有 dnsmasq"
-			else
-				env_row "主 dnsmasq" warn "53 端口上还有其他程序：$v。客户端请求不经过 dnsmasq 时本插件不生效"
-			fi
-			;;
-		*) env_row "主 dnsmasq" fail "53 端口上没有 dnsmasq（当前：${v:-无}）。本插件依赖 dnsmasq 接收客户端的 DNS 请求" ;;
-		esac
-	fi
-
-	# 普通查询的原有上游保持不变，方便核对 ChinaDNS 等分流链路。
-	v=$(uci -q get "dhcp.$DNS_INSTANCE.server" | tr ' ' '\n' | grep -v '^/' | tr '\n' ' ')
-	if [ -n "$v" ]; then
-		env_row "主 DNS 原有上游" info "普通查询仍使用：$v（本插件仅新增下载域名规则）"
-	else
-		d=$(uci -q get "dhcp.$DNS_INSTANCE.resolvfile")
-		env_row "主 DNS 原有上游" info "未配置全局 server；保留原 resolvfile / 其他分流设置：${d:-系统默认}"
-	fi
-
-	# 解析实例与规则
-	if [ "$enabled" = 0 ]; then
-		env_row "解析实例" info "插件未启用"
-		if port_available "$port"; then lv=ok d="端口 $port 空闲"; else lv=fail d="端口 $port 已被其他程序占用，请换一个端口"; fi
-		env_row "解析端口" "$lv" "$d"
-	else
-		if resolver_running; then
-			env_row "解析实例" ok "运行中，127.0.0.1:$port"
-		else
-			env_row "解析实例" fail "未运行。被接管的下载域名此时无法解析，请查看系统日志"
-		fi
-		n=0 miss=0 got=$(main_rules_now)
-		for t in $(cat "$STATE_DIR/main_rules" 2>/dev/null); do
-			n=$((n + 1))
-			echo "$got" | grep -qxF "$t" || miss=$((miss + 1))
-		done
-		if [ "$n" = 0 ]; then
-			env_row "主 dnsmasq 规则" fail "没有写入任何规则"
-		elif [ "$miss" -gt 0 ]; then
-			env_row "主 dnsmasq 规则" fail "应有 $n 条，缺少 $miss 条（可能被其他程序改写），点“重新应用”恢复"
-		else
-			env_row "主 dnsmasq 规则" ok "$n 条下载域名规则指向 127.0.0.1#$port"
-		fi
-	fi
-
-	# 客户端的 DNS 请求实际到达哪里
-	ports=$(dns_redirect_ports | grep -vx 53 | head -n 3 | tr '\n' ' ')
-	pw=$(passwall_state)
-	if [ -z "$ports" ]; then
-		env_row "DNS 入口" ok "没有发现 DNS 重定向规则，客户端发给路由器的请求直接到主 dnsmasq"
-	else
-		for p in $ports; do
-			conf=""
-			for t in $(passwall_dnsmasq_confs); do
-				grep -qx "port=$p" "$t" 2>/dev/null && conf=$t
-			done
-			if [ -z "$conf" ]; then
-				env_row "DNS 入口" warn "防火墙把局域网 DNS 请求重定向到端口 $p，那里不是已识别的 dnsmasq，本插件的规则可能不生效"
-			elif [ "$enabled" = 1 ] && passwall_out_of_sync; then
-				env_row "DNS 入口" fail "请求被重定向到 Passwall 的 dnsmasq 副本（端口 $p），副本还没有载入本插件的规则，需要重启 Passwall"
-			else
-				env_row "DNS 入口" ok "请求被重定向到 Passwall 的 dnsmasq 副本（端口 $p），副本会复制主 dnsmasq 的下载域名规则"
-			fi
-		done
-	fi
-
-	# 实际解析结果：主 dnsmasq 和每个重定向入口都查一遍
-	if [ "$enabled" = 1 ]; then
-		for g in cn com; do
-			d="assets1.xboxlive.$g"
-			want=$(expected_ip "$g")
-			if [ -z "$want" ]; then
-				if [ "$g" = cn ] && ! cfg_bool optimize_cn 1; then
-					env_row "解析 $d" info "国内优选未开启，按默认解析"
-				elif [ "$g" = com ] && [ "$mode" = off ]; then
-					env_row "解析 $d" info "国际域名不处理，按默认解析"
-				else
-					env_row "解析 $d" info "还没有测速结果，暂按默认解析"
-				fi
-				continue
-			fi
-			lv=ok v=""
-			for p in 53 $ports; do
-				got=$(q_a "$d" "127.0.0.1:$p")
-				if [ "$got" = "$want" ]; then
-					v="$v 端口 $p → $got；"
-				else
-					lv=fail
-					v="$v 端口 $p → ${got:-无结果}（应为 $want）；"
-				fi
-				has_aaaa "$d" "127.0.0.1:$p" && { lv=fail; v="$v 端口 $p 仍返回 IPv6 地址；"; }
-			done
-			env_row "解析 $d" "$lv" "$v"
-		done
-	fi
-
-	# com→cn 重定向
-	if cfg_bool redirect_cn 0; then
-		why=$(redirect_blocker)
-		if [ -n "$why" ]; then
-			env_row "com→cn 重定向" fail "无法启用：$why"
-		elif [ "$enabled" = 1 ]; then
-			got=$(curl -s --noproxy '*' -o /dev/null -m 4 -H 'Host: assets1.xboxlive.com' \
-				-w '%{http_code} %{redirect_url}' "http://$(lan_ip)/xbox-accel/selftest?probe=1" 2>/dev/null)
-			if [ "$got" = "302 http://assets1.xboxlive.cn/xbox-accel/selftest?probe=1" ]; then
-				env_row "com→cn 重定向" ok "http://$(lan_ip) 对国际下载域名返回 302，路径与参数保持不变"
-			else
-				env_row "com→cn 重定向" fail "自检请求得到“${got:-无响应}”，应为 302 到 assets1.xboxlive.cn"
-			fi
-		else
-			env_row "com→cn 重定向" ok "前置条件满足：uhttpd 在 80 端口提供 HTTP"
-		fi
-	else
-		env_row "com→cn 重定向" info "未开启"
-	fi
-
-	# 测速文件
-	for g in $(groups_enabled); do
-		url=$(group_url "$g")
-		ip=$(q_a "$(url_host "$url")" "$(cfg fallback_dns 223.5.5.5 | awk '{print $1}')" | awk '{print $1}')
-		if [ -z "$ip" ]; then
-			env_row "测速文件（$g）" warn "无法通过 $(cfg fallback_dns 223.5.5.5 | awk '{print $1}') 解析 $(url_host "$url")，外网或上游 DNS 不通时自动测速会失败"
-			continue
-		fi
-		code=$(probe "$ip" "$(url_host "$url")" "$(url_path "$url")" "$(group_offset "$g")" 1024 6 | awk '{print $1}')
-		if [ "$code" = 206 ]; then
-			env_row "测速文件（$g）" ok "可下载：$url"
-		else
-			env_row "测速文件（$g）" warn "节点 $ip 返回 HTTP ${code:-000}。持续如此说明该文件已失效，需要更换测速地址"
-		fi
-	done
-
-	# 定时任务
-	if [ "$enabled" = 1 ]; then
-		n=$(grep -cF "$CRON_TAG" "$CRON_FILE" 2>/dev/null)
-		if [ "$(to_int "$n")" = 0 ]; then
-			env_row "定时任务" fail "计划任务里没有本插件的条目，点“重新应用”恢复"
-		elif ! pidof crond >/dev/null 2>&1; then
-			env_row "定时任务" fail "cron 服务没有运行，自动测速和健康检查不会执行"
-		else
-			env_row "定时任务" ok "完整测速：$(schedule_label)；健康检查：$(health_label)；使用路由器系统时区"
-		fi
-	fi
-
-	# Passwall
-	case "$pw" in
-	none) env_row "Passwall" info "未检测到 Passwall" ;;
-	passwall2) env_row "Passwall" warn "检测到 Passwall 2：本插件没有适配它的直连集合和 DNS 副本，请在 Passwall 2 里把 Xbox 下载域名设为直连" ;;
-	stopped) env_row "Passwall" info "已安装，当前没有运行" ;;
-	running)
-		if ! cfg_bool passwall_direct 1; then
-			env_row "Passwall" warn "运行中；“加入直连集合”已关闭，国际节点的下载流量可能被送进代理"
-		else
-			miss=""
-			for ip in $(best_ip cn) $(best_ip com); do
-				in_passwall_direct "$ip" || miss="$miss $ip"
-			done
-			if [ -n "$miss" ]; then
-				env_row "Passwall" warn "运行中；当前节点$miss 不在直连集合 psw_white 里（健康检查会重新加入；Passwall 关闭了“直连列表”时该集合不起作用）"
-			else
-				env_row "Passwall" ok "运行中；当前节点已在直连集合 psw_white 里"
-			fi
-		fi
-		;;
-	esac
-
-	json_close_array
-	json_dump
+	diagnostic_environment
 }
 
 # ---------- 命令 ----------
 
 cmd_test() {
-	local g only=$1 any=1
-	validate_config
-	command -v curl >/dev/null 2>&1 || die "缺少 curl"
+	local g only=${1:-all} intent=${2:-apply} groups success=0 failed=0 partial=0 result=1 application_rc=0
+	TEST_MODE=$intent; TASK_KIND=test
+	[ "$intent" = measure ] && TASK_KIND=measure
 	lock
-	say "开始测速"
-	for g in $(groups_enabled); do
-		[ -n "$only" ] && [ "$only" != all ] && [ "$only" != "$g" ] && continue
-		test_group "$g" && any=0
-	done
-	if [ "$any" = 0 ]; then
-		apply
-		say "测速结束"
+	task_begin
+	[ "$TASK_MEMORY_READY" = 1 ] || die "无法记录任务摘要，已停止测速"
+	task_stage configuration
+	TASK_CODE=CONFIG_INVALID; TASK_MESSAGE='配置校验未通过'
+	if [ "$intent" = measure ]; then
+		groups=$(measurement_groups "$only") || die '请选择有效的测速平台'
+		validate_measurement_config "$groups"
 	else
-		note "测速没有得到可用节点，现有配置保持不变"
+		validate_config
+		case "$only" in all|cn|com|store|ps|xbox_old|switch) ;; *) die "未知测速组：$only" ;; esac
+		groups=$(groups_active)
 	fi
-	return "$any"
+	TASK_CODE=RUNNING
+	for g in $groups; do
+		[ "$intent" != measure ] && [ "$only" != all ] && [ "$only" != "$g" ] && continue
+		if test_group "$g"; then success=$((success+1)); partial=$((partial+${TEST_GROUP_PARTIAL:-0})); else failed=$((failed+1)); fi
+	done
+	if [ "$success" -eq 0 ]; then
+		if [ "$failed" -eq 0 ]; then
+			TASK_STATUS=skipped; TASK_CODE=NO_ENABLED_GROUP; TASK_MESSAGE='请求的测速功能未开启，没有执行'
+		else
+			TASK_STATUS=failed; TASK_CODE=ALL_GROUPS_FAILED; TASK_MESSAGE='所有请求组失败；旧节点未替换'
+		fi
+		return 1
+	fi
+	if [ "$intent" = measure ]; then
+		TASK_APPLY_STATUS=skipped; TASK_APPLY_CODE=MEASUREMENT_ONLY; TASK_APPLY_MESSAGE='独立测速结果已保存，采用结果时应用配置'
+	elif is_enabled; then
+		task_stage apply
+		apply; application_rc=$?
+		if [ "$application_rc" = 1 ]; then
+			TASK_STATUS=failed; TASK_CODE=APPLICATION_FAILED; TASK_MESSAGE="$TASK_APPLY_MESSAGE"
+			return 1
+		fi
+	else
+		TASK_APPLY_STATUS=skipped; TASK_APPLY_CODE=DISABLED; TASK_APPLY_MESSAGE='插件未启用，只保存测速结果'
+	fi
+	if [ "$failed" -gt 0 ] || [ "$partial" -gt 0 ] || [ "$application_rc" = 2 ]; then
+		TASK_STATUS=partial; TASK_CODE=PARTIAL_RESULT; TASK_MESSAGE='部分组失败或配置尚未全部验收；查看分组与验收详情'; result=2
+	else
+		TASK_STATUS=success; TASK_CODE=TEST_COMPLETED; TASK_MESSAGE='采样完成，应用和设备下载状态见总览'; result=0
+		[ "$intent" != measure ] || { TASK_CODE=MEASUREMENT_READY; TASK_MESSAGE='独立测速完成，请在结果中选择采用'; }
+	fi
+	task_stage finished
+	say "测速结束：status=$TASK_STATUS success_groups=$success failed_groups=$failed"
+	return "$result"
 }
 
 cmd_health() {
-	local g ip url changed=1 try ok now last
+	local g ip url changed=1 try ok now last success=0 failed=0 partial=0 application_rc=0
 	is_enabled || return 0
-	lock
+	TASK_KIND=health; TASK_TRIGGER=health
+	lock; task_begin
+	[ "$TASK_MEMORY_READY" = 1 ] || die "无法记录健康检查摘要，已停止"
+	validate_config
+	task_stage health
 	if drifted; then
-		note "解析实例或主 dnsmasq 规则与应有状态不一致，重新应用"
+		task_event WARN CONFIG_DRIFT '解析实例或主规则与应有状态不一致，准备修复'
 		changed=0
 	fi
 	for g in $(groups_active); do
-		if ! ip=$(best_ip "$g"); then
-			# 还没有可用节点：最多每 30 分钟重试一次
-			now=$(date +%s)
-			last=$(to_int "$(cat "$TMP_DIR/retry_$g" 2>/dev/null)")
-			[ $((now - last)) -ge 1800 ] || continue
+		ip=$(best_ip "$g")
+		if ! group_result_ready "$g"; then
+			now=$(date +%s); last=$(to_int "$(cat "$TMP_DIR/retry_$g" 2>/dev/null)")
+			if [ $((now-last)) -lt 1800 ]; then
+				group_report "$g" skipped RETRY_BACKOFF '没有可用节点；尚未到重试时间'
+				continue
+			fi
 			echo "$now" >"$TMP_DIR/retry_$g"
-			note "[$g] 还没有可用节点，尝试测速"
-			test_group "$g" && changed=0
+			if test_group "$g"; then changed=0; success=$((success+1)); partial=$((partial+${TEST_GROUP_PARTIAL:-0})); else failed=$((failed+1)); fi
 			continue
 		fi
-		passwall_direct "$ip"
-		url=$(group_url "$g")
-		ok=1
+		if ! prepare_group_resource "$g"; then
+			group_report "$g" failed "$GROUP_RESOURCE_CODE" "$GROUP_RESOURCE_MESSAGE" "$ip"
+			task_event WARN "$GROUP_RESOURCE_CODE" "group=$g $GROUP_RESOURCE_MESSAGE"
+			failed=$((failed+1)); continue
+		fi
+		passwall_direct "$ip"; ok=1
 		for try in 1 2 3; do
-			if alive "$ip" "$(url_host "$url")" "$(url_path "$url")" "$(group_offset "$g")"; then
-				ok=0
-				break
-			fi
+			if group_alive "$g" "$ip"; then ok=0; break; fi
+			if [ "$g" = store ] && [ "$try" = 1 ]; then prepare_group_resource store force || break; fi
 			sleep 3
 		done
-		[ "$ok" = 0 ] && continue
-		note "[$g] 当前节点 $ip 连续 3 次不可用，重新测速"
-		# 全部候选都不可用时 test_group 会保留现有配置（多半是外网中断）
-		test_group "$g" && changed=0
+		if [ "$ok" = 0 ]; then
+			group_report "$g" success HEALTH_OK '当前节点资源检查通过；本次未重新测量速度' "$ip"
+			success=$((success+1)); continue
+		fi
+		task_event WARN HEALTH_FAILED "group=$g ip=$ip 连续三次资源检查失败，准备重测"
+		if test_group "$g"; then changed=0; success=$((success+1)); partial=$((partial+${TEST_GROUP_PARTIAL:-0})); else failed=$((failed+1)); fi
 	done
-	[ "$changed" = 0 ] && apply
+	if [ "$changed" = 0 ]; then
+		task_stage apply
+		apply; application_rc=$?
+		if [ "$application_rc" = 1 ]; then
+			TASK_STATUS=failed; TASK_CODE=APPLICATION_FAILED; TASK_MESSAGE="$TASK_APPLY_MESSAGE"
+			return 1
+		elif [ "$application_rc" = 2 ]; then
+			TASK_STATUS=partial; TASK_CODE=ROUTER_NOT_FULLY_VERIFIED; TASK_MESSAGE="$TASK_APPLY_MESSAGE"
+			return 2
+		fi
+	else
+		TASK_APPLY_STATUS=skipped; TASK_APPLY_CODE=NO_CHANGE; TASK_APPLY_MESSAGE='本次没有修改配置，不代表重新验收链路'
+	fi
+	if [ "$failed" -gt 0 ] || [ "$partial" -gt 0 ]; then
+		TASK_STATUS=failed; [ "$success" -gt 0 ] && TASK_STATUS=partial
+		TASK_CODE=HEALTH_OR_RETEST_FAILED; TASK_MESSAGE='部分健康检查或重新测速失败，旧配置按分组保留'
+		return 1
+	fi
+	TASK_STATUS=success; TASK_CODE=HEALTH_COMPLETED; TASK_MESSAGE='健康检查完成；不等于 Xbox 下载效果已确认'
+	[ "$success" -gt 0 ] || { TASK_STATUS=skipped; TASK_CODE=NOT_DUE; TASK_MESSAGE='本次无需执行健康检查'; }
 	return 0
 }
 
@@ -1274,20 +1638,20 @@ cmd_status() {
 	say "xbox-accel $VERSION"
 	if is_enabled; then say "服务：已启用"; else say "服务：未启用"; fi
 	pid=$(cat "$RUN_DIR/dnsmasq.pid" 2>/dev/null)
-	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+	if resolver_running; then
 		say "解析实例：运行中（127.0.0.1:$port，PID $pid）"
 	else
 		say "解析实例：未运行"
 	fi
 	cfg_bool optimize_cn 1 && say "国内域名：优选" || say "国内域名：不处理"
 	case "$(com_mode)" in
-	redirect) say "国际域名：重定向到国内（302 入口 $(lan_ip)）" ;;
+	redirect) say "国际域名：重定向到国内（入口 $(redirect_ip):80，独立服务 $(lan_ip):$(redirect_port)）" ;;
 	optimize) say "国际域名：优选" ;;
 	off) say "国际域名：不处理" ;;
 	esac
 	cfg_bool redirect_cn 0 && [ -n "$(redirect_blocker)" ] && say "  重定向未生效：$(redirect_blocker)"
-	for g in cn com; do
-		ip=$(best_ip "$g") || { say "[$g] 还没有测速结果"; continue; }
+	for g in $ALL_GROUPS; do
+		ip=$(best_ip "$g") || { say "[$(group_label "$g")] 还没有测速结果"; continue; }
 		last=$(cat "$TMP_DIR/last_$g" 2>/dev/null)
 		if [ -n "$last" ]; then
 			set -- $last
@@ -1306,10 +1670,13 @@ cmd_status() {
 }
 
 cmd_check() {
-	local out keys k name level detail mark
-	out=$(json_env)
+	local out keys k name level detail mark code expected observed result router measurement direct_set saved_log_active
+	cmd_application_task verify; result=$?
+	out=$(application_report_document)
 	. /usr/share/libubox/jshn.sh
-	json_load "$out" || die "环境检测失败"
+	jshn -r "$out" >/dev/null 2>&1 && json_load "$out" || die "环境检测没有返回完整有效 JSON，不能确认成功"
+	# 终端报告直接输出；任务日志已按采集模式记录验收项。
+	saved_log_active=$LOG_ACTIVE; LOG_ACTIVE=0
 	json_select environment
 	json_get_keys keys
 	for k in $keys; do
@@ -1317,36 +1684,48 @@ cmd_check() {
 		json_get_var name name
 		json_get_var level level
 		json_get_var detail detail
+		json_get_var code code
+		json_get_var expected expected
+		json_get_var observed observed
 		json_select ..
 		case "$level" in
 		ok) mark="[ 正常 ]" ;;
 		warn) mark="[ 注意 ]" ;;
 		fail) mark="[ 异常 ]" ;;
+		unknown) mark="[ 未确认 ]" ;;
+		skipped) mark="[ 未执行 ]" ;;
 		*) mark="[ 信息 ]" ;;
 		esac
-		say "$mark $name：$detail"
+		say "$mark [$code] $name：$detail"
+		[ -z "$expected" ] || say "  预期=$expected；实际=${observed:-无结果}"
 	done
+	json_select ..; json_select summary
+	json_get_var router router; json_get_var measurement measurement; json_get_var direct_set direct_set
 	say
-	say "以上检测都在路由器本机进行。最终请在局域网设备上确认：nslookup assets1.xboxlive.cn $(lan_ip)"
+	say "验收结果：路由器=$router；测试资源=${measurement:-skipped}；直连集合=${direct_set:-skipped}；任务=$TASK_STATUS（exit=$result）"
+	say "客户端 DNS 与下载路径请在局域网设备和 Xbox 上确认；建议运行 nslookup assets1.xboxlive.cn $(lan_ip)"
+	LOG_ACTIVE=$saved_log_active
+	return "$result"
 }
 
 cmd_enable() {
 	uci -q set "$NAME.main.enabled=1" && uci -q commit "$NAME" || die "无法写入配置"
-	"$INIT" enable
-	"$INIT" restart
+	"$INIT" enable || return 1
+	"$INIT" restart || return 1
 	cmd_status
 }
 
 cmd_disable() {
 	uci -q set "$NAME.main.enabled=0" && uci -q commit "$NAME" || die "无法写入配置"
-	"$INIT" stop
+	"$INIT" stop || return 1
 	say "已停用：主 dnsmasq 规则、302 入口和定时任务均已移除"
 }
 
 cmd_reset() {
-	rm -f "$STATE_DIR"/best_* "$STATE_DIR"/domains_* "$TMP_DIR"/last_*
-	say "已清除测速结果"
-	apply
+	cancel_task
+	rm -f "$STATE_DIR"/best_* "$STATE_DIR"/domains_* "$STATE_DIR"/resources_* "$TMP_DIR"/last_* "$TMP_DIR/store-resource.json"
+	if is_enabled; then "$INIT" reload 7>&- 8>&- 9>&- || return 1; fi
+	say "已停止任务并清除当前节点；历史摘要保留。尚未重新测速，不能宣称加速生效。"
 }
 
 usage() {
@@ -1354,20 +1733,52 @@ usage() {
 xbox-accel $VERSION
 
 用法：xbox-accel <命令>
-  test [cn|com]  发现候选节点、测速、选优并应用（在当前终端里运行）
-  start_test     同上，但作为后台任务运行（定时任务和 LuCI 用的就是它）
+  test [cn|com|store|ps|xbox_old|switch]  发现候选节点、测速、选优并应用
+  start_test     后台自动选优并应用，供计划任务和旧版 CLI 使用
+  measure [平台,平台|all]  独立测速并保存候选，支持关闭的功能
+  start_measure  后台独立测速
+  start_adopt <平台> <结果ID>  启用功能、采用候选并验收
   cancel         停止正在运行的后台任务
   status         查看当前模式、节点和解析结果
   check          环境检测：DNS 链路、解析结果、重定向、定时任务、Passwall
-  enable         启用并设为开机自启
+  start_verify   后台完整验收，完成后查看任务摘要
+  start_restart  后台重启服务并验收当前配置
+  start_report   后台生成脱敏报告 /tmp/xbox-accel/diagnostic-report.json
+  clear_log      清空运行日志和已保存的历史日志快照
+  enable         启用功能（开机恢复按自启动设置执行）
   disable        停用并撤销对系统的全部改动
   health         检查当前节点是否可用，不可用则重新测速
   reset          清除测速结果，恢复默认解析
 EOF
 }
 
+case "$1" in -v|--version) echo "$VERSION"; exit 0 ;; esac
+case "$1" in
+_service) shift; run_service_action "$@"; exit $? ;;
+_stop_resolver) stop_resolver; exit $? ;;
+esac
+[ -r "$SHARE_DIR/redirect.sh" ] || { echo '错误：重定向模块缺失，请重新安装插件' >&2; exit 1; }
+. "$SHARE_DIR/redirect.sh"
+case "$1" in
+_stop_redirect) stop_redirect; exit $? ;;
+_restore_redirect) restore_redirect_firewall; exit $? ;;
+_web_guard) web_guard; exit $? ;;
+esac
+[ -r "$SHARE_DIR/platforms.sh" ] || { echo '错误：平台模块缺失，请重新安装插件' >&2; exit 1; }
+. "$SHARE_DIR/platforms.sh"
+if [ ! -r "$SHARE_DIR/diagnostics.sh" ]; then
+	echo "错误：诊断模块缺失，请重新安装插件" >&2
+	exit 1
+fi
+. "$SHARE_DIR/diagnostics.sh"
+for diagnostic_module in verification application privacy quick-check measurement records observation; do
+	[ -r "$SHARE_DIR/$diagnostic_module.sh" ] || { echo "错误：诊断模块 $diagnostic_module 缺失，请重新安装" >&2; exit 1; }
+	. "$SHARE_DIR/$diagnostic_module.sh"
+done
+
 case "$1" in
 test) cmd_test "$2" ;;
+measure) cmd_test "${2:-all}" measure ;;
 health) cmd_health ;;
 status) cmd_status ;;
 check) cmd_check ;;
@@ -1377,19 +1788,41 @@ reset) cmd_reset ;;
 cancel) cancel_task ;;
 start_test)
 	validate_config
-	start_task "${2:-all}"
+	start_task "${2:-all}" "${3:-manual_cli}"
 	;;
+start_measure) start_task measure "${3:-manual_cli}" "${2:-all}" ;;
+start_adopt) start_task adopt "${4:-manual_ui}" "$2" "$3" ;;
 clear_log)
 	mkdir -p "$TMP_DIR"
 	: >"$LOG_FILE"
+	rm -f "$STATE_DIR/activity-last.log"
+	clear_event_records
 	;;
 json_status) json_status ;;
 json_env) json_env ;;
+json_preflight) quick_environment ;;
+json_records) json_records ;;
+_observe) observation_loop ;;
+start_apply)
+	missing=0
+	if is_enabled; then for group in $(groups_active); do group_result_ready "$group" || missing=1; done; fi
+	if [ "$missing" = 1 ]; then start_task all first_run; else start_task apply "${2:-manual_ui}"; fi
+	;;
+start_verify) start_task verify "${2:-manual_ui}" ;;
+start_restart) start_task restart "${2:-manual_ui}" ;;
+start_report) start_task report "${2:-manual_ui}" ;;
 _worker)
 	mkdir -p "$TMP_DIR"
 	QUIET=1
 	exec >>"$LOG_FILE" 2>&1
-	cmd_test "$2"
+	TASK_ID=${4:-}; TASK_TRIGGER=${3:-manual_ui}
+	case "$2" in
+	apply|restart|verify) cmd_application_task "$2" ;;
+	report) cmd_report_task ;;
+	measure) cmd_test "${5:-all}" measure ;;
+	adopt) cmd_adopt_measurement "$5" "$6" ;;
+	*) TASK_KIND=test; cmd_test "$2" ;;
+	esac
 	;;
 _validate) validate_config ;;
 _setup) setup ;;

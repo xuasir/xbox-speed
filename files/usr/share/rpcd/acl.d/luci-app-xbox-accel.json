@@ -5,12 +5,26 @@
 			"ubus": {
 				"xbox-accel": [
 					"status",
-					"environment"
+					"environment",
+					"records"
 				]
 			},
 			"uci": [
 				"xbox-accel"
-			]
+			],
+			"file": {
+				"/tmp/xbox-accel/diagnostic-report.json": [
+					"read"
+				],
+				"/tmp/xbox-accel/last-application.json": [
+					"read"
+				]
+			},
+			"cgi-io": {
+				"download": [
+					"read"
+				]
+			}
 		},
 		"write": {
 			"ubus": {

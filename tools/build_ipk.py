@@ -24,7 +24,7 @@ BASE_VERSION_RE = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
 VERSION_RE = re.compile(BASE_VERSION_RE + r'(?:~beta\.[1-9][0-9]*\.g[0-9a-f]{7,40})?')
 EXECUTABLES = {
     'usr/bin/xbox-accel', 'etc/init.d/xbox-accel',
-    'www/cgi-bin/xbox-accel-redirect', 'usr/libexec/rpcd/xbox-accel',
+    'usr/share/xbox-accel/redirect.cgi', 'usr/share/xbox-accel/firewall.sh', 'usr/libexec/rpcd/xbox-accel',
 }
 CONFFILES = ['/etc/config/xbox-accel']
 
@@ -32,6 +32,7 @@ POSTINST = '''#!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/xbox-accel enable
 /etc/init.d/rpcd reload
+/usr/bin/xbox-accel _web_guard || true
 rm -f /tmp/luci-indexcache*
 rm -rf /tmp/luci-modulecache
 [ "$(uci -q get xbox-accel.main.enabled)" = 1 ] && /etc/init.d/xbox-accel restart
@@ -155,10 +156,10 @@ A .ipk cannot be installed by apk. See README.md for limitations.
 '''.encode()
     control = (
         f'Package: {NAME}\nVersion: {target_version}-1\n'
-        'Depends: luci-base, rpcd, curl, uhttpd, jshn\n'
+        'Depends: luci-base, rpcd, curl, ca-bundle, uhttpd, jshn, conntrack\n'
         'Section: luci\nArchitecture: all\nLicense: MIT\n'
         f'Installed-Size: {sum(len(data) for data in contents.values())}\n'
-        'Description: Xbox download CDN optimization and optional HTTP redirect.\n'
+        'Description: Game download CDN optimization and Xbox HTTP redirect.\n'
         ' Uses the existing dnsmasq; does not proxy download traffic.\n'
     ).encode()
 

@@ -1,6 +1,8 @@
 config main 'main'
 	# 总开关。建议用 xbox-accel enable / disable 切换
 	option enabled '0'
+	# 开机恢复已启用的功能；关闭后仍执行启动清理，不自动运行测速
+	option autostart '1'
 
 	# 国内下载域名（*.xboxlive.cn）指向最快节点
 	option optimize_cn '1'
@@ -8,16 +10,44 @@ config main 'main'
 	option optimize_com '1'
 	# 把国际下载域名 302 到国内域名。开启后国际域名不再优选
 	option redirect_cn '0'
+	# 独立重定向服务端口；专用虚拟地址需位于直连网段之外
+	option redirect_port '18081'
+	option redirect_ip '192.0.2.1'
+	# 独立服务配置版本，用于迁移旧版 redirect_ip 的路由器地址语义
+	option redirect_service_version '1'
 	# 同时接管主机通过 SRV 记录拿到的 4 个备用 CDN 主机名
 	option override_cdn_hosts '1'
+
+	# 扩展平台独立选优，默认关闭
+	option optimize_store '0'
+	option optimize_ps '0'
+	option optimize_xbox_old '0'
+	option optimize_switch '0'
+	# store：微软商店应用；xbox：Xbox 应用。自动刷新带有效期的测速链接
+	option store_test_app 'store'
+	# 可选 test_url_store / test_url_ps / test_url_xbox_old / test_url_switch
+	# 可选 list extra_ips_<平台>：该组额外公网 IPv4 候选
+	# PS 按域名使用独立资源；可用 list verification_urls_ps 覆盖或补充
+	# Switch 默认把公开测速选中节点映射到游戏下载域名
+	# 游戏链接用于可选增强校验；失败时对应域名走上游，删除后恢复默认映射
+	# list verification_urls_switch 'https://atum.hac.lp1.d4c.nintendo.net/实际游戏资源路径'
 
 	# 运营商：auto（只按本线路发现候选）/ telecom / unicom / mobile
 	# 选了运营商后，会额外询问该运营商其他地区的节点来扩大候选范围
 	option isp 'auto'
 
-	# 测速与健康检查的定时
+	# 完整测速：daily / weekly / monthly，使用路由器系统时区
+	option schedule_type 'daily'
+	option schedule_time '05:15'
+	option schedule_weekday '0'
+	# 29..31 号在没有该日期的月份跳过
+	option schedule_monthday '1'
+	# 旧版 cron 保留兼容；schedule_type 缺失或为 legacy 时使用
 	option cron '15 5 * * *'
 	option health_interval '10'
+
+	# concise：任务与阶段摘要、节点变更、告警；detail：逐项诊断
+	option log_mode 'concise'
 
 	# 初筛与复测的单节点上限
 	option quick_size_mb '4'
@@ -36,6 +66,7 @@ config main 'main'
 	list fallback_dns '223.5.5.5'
 	list fallback_dns '119.29.29.29'
 
-	# 把候选与选中节点加入 Passwall 直连集合；规则变化时自动重启 Passwall
+	# 把候选与选中节点加入 Passwall 直连集合；启用时自动重载新增规则
+	# 撤销功能时始终重载已识别副本并清理旧规则
 	option passwall_direct '1'
 	option passwall_restart '1'
