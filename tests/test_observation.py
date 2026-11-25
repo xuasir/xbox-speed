@@ -2,6 +2,7 @@
 """连接原始/回复元组、IPv6、QUIC 和直连证据的边界检查。"""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -10,6 +11,27 @@ RECORDS = LIB.with_name('records.sh')
 
 
 class ObservationTests(unittest.TestCase):
+    def test_saved_device_filter_preserves_observation_freshness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config'
+            base = "package xbox-accel\n\nconfig main 'main'\n\toption enabled '1'\n"
+            body = r'''
+. "$1"
+RESOLVER_CONF=$PWD/resolver.conf; REDIRECT_CONF=$PWD/redirect.conf
+STATE_DIR=$PWD/state; ALL_GROUPS=; OBSERVATION_PYTHON=$2
+uci() { cat "$PWD/config"; }
+sha256sum() { "$OBSERVATION_PYTHON" -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'; }
+observation_signature
+'''
+            def signature(content):
+                config.write_text(content)
+                return subprocess.check_output(['sh', '-c', body, 'signature-test', str(LIB), sys.executable],
+                                               cwd=directory, text=True).strip()
+            original = signature(base)
+            self.assertEqual(original, signature(base + "\toption download_devices ''\n"))
+            self.assertEqual(original, signature(base + "\tlist download_devices '192.168.1.20'\n\tlist download_devices '192.168.1.21'\n"))
+            self.assertNotEqual(original, signature(base.replace("enabled '1'", "enabled '0'")))
+
     def parse(self, text):
         result = subprocess.run(['sh', '-c', '. "$1"; observation_parse_connections',
                                  'observation-test', str(LIB)], input=text, capture_output=True, text=True, check=True)

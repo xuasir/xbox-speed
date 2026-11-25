@@ -30,6 +30,7 @@ class BuildTests(unittest.TestCase):
             with inner_tar(package, 'control.tar.gz') as control:
                 self.assertIn(f'Version: {ver}-1\n', control.extractfile('./control').read().decode())
                 self.assertIn('conntrack', control.extractfile('./control').read().decode().split('Depends: ', 1)[1].split('\n', 1)[0])
+                self.assertIn('jsonfilter', control.extractfile('./control').read().decode().split('Depends: ', 1)[1].split('\n', 1)[0])
                 self.assertEqual(control.getmember('./postinst').mode, 0o755)
                 self.assertIn('/usr/bin/xbox-accel _web_guard || true\n', control.extractfile('./postinst').read().decode())
             with inner_tar(package, 'data.tar.gz') as data:

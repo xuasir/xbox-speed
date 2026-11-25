@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const source = fs.readFileSync(path.join(__dirname,'../files/www/luci-static/resources/view/xbox-accel/overview.js'),'utf8');
-const calls=[],options=[],tabs=[],downloads=[],listeners=new Map(),changes=[];
+const calls=[],options=[],tabs=[],downloads=[],listeners=new Map(),changes=[],rpcSpecs=[];
 const config={cron:'0 1 * * 1',health_interval:'40',optimize_cn:'1',optimize_com:'1',redirect_cn:'0',enabled:'1'};
 const status={version:'0.3.0',enabled:true,running:true,testing:false,mode:'optimize',optimize_cn:true,
 	cn_ip:'8.8.4.4',com_ip:'1.1.1.1',log:'<script>alert(1)</script>',platforms:{ps:{enabled:false},switch:{enabled:false}}};
@@ -14,7 +14,8 @@ let records={events:[],errors:[],tasks:[]};
 String.prototype.format=function(...args){let i=0;return this.replace(/%[sd]/g,()=>String(args[i++]));};
 function E(tag,attrs,children){
 	return {tag,attrs:attrs||{},children:children||[],value:attrs?.value||'',textContent:'',disabled:false,checked:false,
-		scrollTop:0,clientHeight:0,scrollHeight:0};
+		scrollTop:0,clientHeight:0,scrollHeight:0,events:{},
+		addEventListener(name,handler){this.events[name]=handler;},hasAttribute(name){return this.attrs[name]!=null;}};
 }
 function text(node){
 	if(node==null)return '';
@@ -38,6 +39,7 @@ function section(tab){
 function addOption(parent,tab,type,name,args){
 	const o={tab,type,name,option:name,title:args[0],description:args[1],choices:[],dependencies:[],
 		depends(...args){this.dependencies.push(args);},value(key,label){this.choices.push([key,label]);},
+		cbid(id){return 'cbid.xbox-accel.'+id+'.'+name;},getValidator(){return()=>true;},
 		cfgvalue(id,value){if(arguments.length===2)this.cachedValue=value;return Object.prototype.hasOwnProperty.call(this,'cachedValue')?this.cachedValue:config[name]??this.default;},getUIElement(){return{setValue(value){changes.push([name,value]);}}}
 	};
 	if(type===form.SectionValue){
@@ -61,25 +63,35 @@ class MapMock{
 const view={extend(def){def.super=function(name){calls.push(['super',name]);return Promise.resolve();};return def;}};
 // 故障注入：模拟浏览器在取得响应前中断请求（LuCI 报 XHR request aborted by browser）。
 const faults={uci:0,status:0,render:0,error:null};
+let deferredStatus=null;
 const interrupted=()=>faults.error||new Error('XHR request aborted by browser');
-const rpc={declare(spec){return(...args)=>{
+const rpc={declare(spec){rpcSpecs.push(spec);return(...args)=>{
 	calls.push([spec.method,...args]);
 	if(spec.method==='status'&&faults.status>0){faults.status--;return Promise.reject(interrupted());}
+	if(spec.method==='status'&&deferredStatus)return deferredStatus;
 	return Promise.resolve(spec.method==='status'?status:spec.method==='environment'?environment:spec.method==='records'?records:actionReply);
 };}};
-const ui={createHandlerFn(ctx,fn){return()=>typeof fn==='string'?ctx[fn]():fn.call(ctx);},addNotification(a,b,type){calls.push(['notify',text(b),type]);}};
+class DropdownMock{
+	constructor(values,choices,options){this.values=values.slice();this.choices=choices;this.options=options;}
+	render(){return this.node=E('div',{id:this.options.id,'class':'cbi-dropdown',multiple:''},Object.values(this.choices));}
+	getValue(){return this.values.slice();}
+	setValue(values){this.values=values.slice();}
+	openDropdown(node){node.attrs.open='';}
+}
+const ui={Dropdown:DropdownMock,createHandlerFn(ctx,fn){return()=>typeof fn==='string'?ctx[fn]():fn.call(ctx);},addNotification(a,b,type){calls.push(['notify',text(b),type]);}};
 const viewNode=E('div',{id:'view'});
 const dom={content(node,children){node.children=children;},append(node,child){node.children=[].concat(node.children||[],[child]);}};
 const document={createElement(){return{click(){calls.push(['download']);}};},getElementById(id){return id==='view'?viewNode:null;},
 	addEventListener(name,fn){listeners.set(name,fn);},removeEventListener(name,fn){if(listeners.get(name)===fn)listeners.delete(name);}};
 // 与 LuCI 一致：失败的读取结果留在缓存中，unload 之后才会重新请求。
-const uci={cached:null,load(){if(this.cached)return this.cached;if(faults.uci>0){faults.uci--;return this.cached=Promise.reject(interrupted());}return Promise.resolve();},unload(){this.cached=null;},get(c,s,key){return config[key];},set(c,s,key,value){config[key]=value;changes.push([key,value]);}};
+const uci={cached:null,load(){calls.push(['uci-load']);if(this.cached)return this.cached;if(faults.uci>0){faults.uci--;return this.cached=Promise.reject(interrupted());}return Promise.resolve();},unload(){calls.push(['uci-unload']);this.cached=null;},get(c,s,key){return config[key];},set(c,s,key,value){config[key]=value;changes.push([key,value]);}};
 const fileApi={read_direct(file){downloads.push(file);return Promise.resolve({text:()=>Promise.resolve('{}')});}};
 const urlApi={createObjectURL:()=> 'blob:diagnostics',revokeObjectURL(){}};
 const L={bind:(fn,ctx)=>fn.bind(ctx)};
-const form={Map:MapMock,NamedSection:1,Flag:2,Value:3,ListValue:4,DynamicList:5,DummyValue:6,SectionValue:7};
+const form={Map:MapMock,NamedSection:1,Flag:2,Value:3,ListValue:4,DynamicList:5,DummyValue:6,SectionValue:7,MultiValue:8};
 let pollStatus;
-const poll={add(fn,interval){pollStatus=fn;assert.strictEqual(interval,5);}};
+const pollFunctions=new Set();
+const poll={add(fn,interval){pollStatus=fn;pollFunctions.add(fn);assert.strictEqual(interval,5);assert.strictEqual(pollFunctions.size,1,'重载后只有一个状态轮询');},remove(fn){pollFunctions.delete(fn);}};
 const body=source.replace(/^'require [^']+';$/gm,'');
 const v=new Function('view','form','uci','rpc','poll','ui','dom','E','L','document','window','fs','URL',body)(
 	view,form,uci,rpc,poll,ui,dom,E,L,document,{confirm:()=>true},fileApi,urlApi);
@@ -87,10 +99,14 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
 (async()=>{
 	const page=await v.render(await v.load());
+	assert(rpcSpecs.every(spec=>spec.nobatch&&spec.reject),'插件 RPC 独立发送并报告后端错误');
 	assert.deepStrictEqual(tabs.map(t=>t.label),['总览','加速功能','测速','运行记录']);
 	assert.strictEqual(page.attrs.class,'xa-product');
-	for(const id of ['_automatic','_compatibility','_sampling','_resource_switch','xbox-accel-diagnostics','xbox-accel-raw-log'])
+	for(const id of ['_automatic','_compatibility','_sampling','_resource_switch','xbox-accel-diagnostics'])
 		assert(!v.disclosures[id].open,'高级内容默认折叠：'+id);
+	assert.strictEqual(find(page,'xbox-accel-raw-log').tag,'div','运行日志直接可见');
+	assert.strictEqual(find(page,'xbox-accel-record-actions').tag,'div','操作按钮直接可见');
+	assert.strictEqual(options.find(o=>o.name==='download_devices').type,form.MultiValue,'设备筛选是可保存的多选配置项');
 	assert.strictEqual(options.find(o=>o.name==='_records').tab,'records');
 	assert.strictEqual(v.logNode.value,status.log);
 	assert(text(v.statusNode).includes('当前插件版本')&&text(v.statusNode).includes(status.version));
@@ -157,12 +173,12 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 	v.updateStatus({...status,observation});
 	assert(text(v.downloadNode).includes('已命中当前节点')&&text(v.downloadNode).includes('分流路径待确认'));
 	assert(text(v.downloadNode).includes('12.30 MB/s（估算）'));
-	const firstDevice=v.deviceInputs['192.168.1.20'].input;
-	firstDevice.checked=true;firstDevice.attrs.change.call(firstDevice);
+	const picker=v.deviceDropdown;
+	assert(picker.options.multiple&&picker.options.optional&&picker.options.select_placeholder==='全部设备');
+	picker.setValue(['192.168.1.20']);picker.node.events['cbi-dropdown-change']();
 	assert(!text(v.downloadNode).includes('1.1.1.1:443'));
 	assert(!text(v.downloadNode).includes('直连已确认'));
-	const secondDevice=v.deviceInputs['192.168.1.21'].input;
-	secondDevice.checked=true;secondDevice.attrs.change.call(secondDevice);
+	picker.setValue(['192.168.1.20','192.168.1.21']);picker.node.events['cbi-dropdown-change']();
 	assert.deepStrictEqual(v.selectedDevices,['192.168.1.20','192.168.1.21']);
 	assert(text(v.downloadNode).includes('8.8.4.4:443')&&text(v.downloadNode).includes('1.1.1.1:443'));
 	assert(!text(v.downloadNode).includes('9.9.9.9:443'));
@@ -170,9 +186,14 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 	assert(!text(v.downloadNode).includes('device2.xboxlive.com'));
 	assert(!text(v.featureNode).includes('下载目标与配置存在差异'));
 	v.updateStatus({...status,observation});
-	assert.strictEqual(v.deviceInputs['192.168.1.20'].input,firstDevice);
-	assert(firstDevice.checked&&secondDevice.checked&&text(v.deviceSelection).includes('2 台设备'));
-	v.updateStatus({status_error:'RPC unavailable'});v.deviceAll.attrs.click();
+	assert.strictEqual(v.deviceDropdown,picker,'观测更新保留下拉框与选择');
+	assert.deepStrictEqual(picker.getValue(),['192.168.1.20','192.168.1.21']);
+	assert(text(v.deviceSelection).includes('2 台设备'));
+	v.updateStatus({...status,observation:{...observation,devices:devices.slice(1)}});
+	assert.deepStrictEqual(v.deviceDropdown.getValue(),['192.168.1.20','192.168.1.21']);
+	assert(text(v.deviceDropdown.choices['192.168.1.20']).includes('等待观测'),'暂时离线的已选设备保留');
+	v.updateStatus({status_error:'RPC unavailable'});
+	v.deviceDropdown.setValue([]);v.deviceDropdown.node.events['cbi-dropdown-change']();
 	assert(text(v.downloadNode).includes('暂停更新'));
 	v.updateStatus({...status,observation});
 	assert(text(v.downloadNode).includes('9.9.9.9:443'));
@@ -261,8 +282,42 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 	// 载入请求被浏览器中断：自动重试后完整渲染，配置与状态都取得。
 	v.retryDelay=1;faults.uci=2;faults.status=1;
 	await v.render(await v.load());
+	await tick();await v.loadStatus();
 	assert.strictEqual(faults.uci,0);assert.strictEqual(faults.status,0);
 	assert(!v.loadFailed&&text(v.statusNode).includes('加速运行中')&&!v.buttons.test.disabled,'短暂中断后页面完整渲染');
+	// 状态请求挂起时，配置和四个标签先渲染；轮询复用请求，取得状态后开放操作。
+	let resolveStatus;
+	deferredStatus=new Promise(resolve=>{resolveStatus=resolve;});calls.length=0;
+	const loading=await v.load();
+	assert(!calls.some(call=>call[0]==='status'),'载入配置阶段只读取 UCI');
+	const loadingPage=await v.render(loading),request=v.statusRequest;
+	assert(find(loadingPage,'xbox-accel-status')&&!v.loadFailed&&text(v.statusNode).includes('正在读取运行状态'));
+	assert(v.buttons.test.disabled);
+	assert.strictEqual(v.loadStatus(),request);
+	assert.strictEqual(calls.filter(call=>call[0]==='status').length,1,'挂起的状态请求只发送一次');
+	deferredStatus=null;resolveStatus(status);await request;
+	assert(v.statusValid&&!v.buttons.test.disabled);
+	// 新页面取得状态后，旧页面的迟到响应继续归属旧请求。
+	deferredStatus=new Promise(resolve=>{resolveStatus=resolve;});
+	await v.render(await v.load());const oldRequest=v.statusRequest;
+	deferredStatus=null;await v.render(await v.load());await v.loadStatus();
+	resolveStatus({...status,enabled:false});await oldRequest;
+	assert.strictEqual(v.latestStatus.enabled,true,'保留新页面取得的状态');
+	// 首页把已完成任务作为历史显示；完整报告在用户展开验收详情时读取。
+	status.last_task={id:'existing-task',kind:'verify',status:'success',started_at:1};
+	status.last_application={status:'verified',available:true,checked_at:2};
+	calls.length=0;const downloaded=downloads.length;
+	await v.render(await v.load());await v.loadStatus();
+	assert(!calls.some(call=>call[0]==='records'),'首页首次状态继续展示历史摘要');
+	assert.strictEqual(downloads.length,downloaded,'首页只展示验收摘要');
+	v.activeTab='records';await v.loadApplicationReportIfOpen();
+	assert.strictEqual(downloads.length,downloaded,'收起的验收区保留摘要');
+	v.disclosures['xbox-accel-diagnostics'].open=true;
+	await v.disclosures['xbox-accel-diagnostics'].attrs.toggle();
+	assert.strictEqual(downloads.length,downloaded+1,'展开验收区读取一次完整报告');
+	v.activeTab='overview';v.updateStatus({...status,last_task:{...status.last_task,id:'new-task'}});await tick();
+	assert.strictEqual(downloads.length,downloaded+1,'总览的新任务完成时继续使用验收摘要');
+	delete status.last_task;delete status.last_application;
 	// 持续中断：显示可恢复页面并隐藏保存按钮，替代停留在“正在载入视图”。
 	faults.uci=Infinity;
 	const failed=await v.render(await v.load());
@@ -275,11 +330,21 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 	await find(viewNode,'xbox-accel-reload').attrs.click();
 	assert(!v.loadFailed&&!find(viewNode,'xbox-accel-load-error')&&find(viewNode,'xbox-accel-status'));
 	assert(calls.some(c=>c[0]==='super'&&c[1]==='addFooter'));
-	// 渲染阶段的请求中断同样重试；超时直接给出可恢复页面；程序错误照常抛出。
-	faults.render=1;await v.render(await v.load());assert(!v.loadFailed&&faults.render===0);
-	faults.render=2;faults.error=new Error('XHR request timed out');
+	// 配置超时清理失败缓存后再读一次；连续超时给出可恢复页面。
+	faults.error=new Error('XHR request timed out');faults.uci=1;
+	await v.render(await v.load());assert(!v.loadFailed&&faults.uci===0);
+	faults.uci=Infinity;calls.length=0;
 	assert(find(await v.render(await v.load()),'xbox-accel-load-error')&&v.loadFailed);
-	assert.strictEqual(faults.render,1,'超时已等待完整时限，交给用户决定是否重试');
+	assert.strictEqual(calls.filter(call=>call[0]==='uci-load').length,2,'配置超时最多读两次');
+	assert.strictEqual(calls.filter(call=>call[0]==='uci-unload').length,2,'每次失败清理 UCI 缓存');
+	faults.uci=0;faults.error=null;
+	// 表单载入中断和超时同样恢复；持续超时有上限；程序错误照常抛出。
+	faults.render=1;await v.render(await v.load());assert(!v.loadFailed&&faults.render===0);
+	faults.render=1;faults.error=new Error('XHR request timed out');
+	await v.render(await v.load());assert(!v.loadFailed&&faults.render===0);
+	faults.render=2;
+	assert(find(await v.render(await v.load()),'xbox-accel-load-error')&&v.loadFailed);
+	assert.strictEqual(faults.render,0,'表单超时最多读两次');
 	faults.render=1;faults.error=new TypeError('boom');
 	await assert.rejects(v.load().then(data=>v.render(data)),/boom/);
 	faults.error=null;await v.render(await v.load());assert(!v.loadFailed);
@@ -292,6 +357,9 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 	await pollNow();
 	assert(text(v.statusNode).includes('状态读取失败')&&v.buttons.test.disabled);
 	await pollNow();assert(text(v.statusNode).includes('加速运行中')&&!v.buttons.test.disabled);
+	faults.status=2;faults.error=new Error('XHR request timed out');await pollNow();await pollNow();
+	assert(v.statusValid&&!v.buttons.test.disabled,'短暂超时保留有效状态');
+	await pollNow();faults.error=null;
 	faults.status=1;faults.error=new Error('Object not found');await pollNow();
 	assert(text(v.statusNode).includes('Object not found'));faults.error=null;
 	console.log('LuCI user workflow: PASS');

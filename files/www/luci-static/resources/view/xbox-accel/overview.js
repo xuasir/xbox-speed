@@ -8,10 +8,11 @@
 'require dom';
 'require fs';
 
-var callStatus = rpc.declare({object:'xbox-accel',method:'status',expect:{'':{}}});
-var callEnvironment = rpc.declare({object:'xbox-accel',method:'environment',expect:{'':{}}});
-var callRecords = rpc.declare({object:'xbox-accel',method:'records',expect:{'':{}}});
-var callAction = rpc.declare({object:'xbox-accel',method:'action',params:['command','groups','result_id'],expect:{'':{}}});
+// 独立发送插件请求，让较慢的状态、记录或操作与 LuCI 的配置读取分别完成。
+var callStatus = rpc.declare({object:'xbox-accel',method:'status',expect:{'':{}},nobatch:true,reject:true});
+var callEnvironment = rpc.declare({object:'xbox-accel',method:'environment',expect:{'':{}},nobatch:true,reject:true});
+var callRecords = rpc.declare({object:'xbox-accel',method:'records',expect:{'':{}},nobatch:true,reject:true});
+var callAction = rpc.declare({object:'xbox-accel',method:'action',params:['command','groups','result_id'],expect:{'':{}},nobatch:true,reject:true});
 var PLATFORMS = [
 	{id:'cn',label:'Xbox 国内',hosts:['assets1.xboxlive.cn'],description:'优选 Xbox 国内下载节点。'},
 	{id:'com',label:'Xbox 国际',hosts:['assets1.xboxlive.com'],description:'选择国际下载使用的方式。'},
@@ -37,7 +38,7 @@ var CSS = '.xa-product .xa-grid{display:grid;grid-template-columns:repeat(auto-f
 	'.xa-product details.xa-disclosure{border:1px solid var(--border-color,#d9dfe5);border-radius:6px;padding:10px;margin:12px 0}' +
 	'.xa-product details.xa-disclosure>summary{cursor:pointer;font-weight:600}.xa-product .xa-table-wrap{overflow-x:auto}' +
 	'.xa-product .xa-chips{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}.xa-product .xa-chips label{padding:8px;border:1px solid var(--border-color,#d9dfe5);border-radius:6px;cursor:pointer}' +
-	'.xa-product #xbox-accel-device .xa-chips label{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%}.xa-product #xbox-accel-device .xa-chips input{flex:0 0 auto;margin:0}.xa-product #xbox-accel-device .xa-chips span{min-width:0;overflow-wrap:anywhere}' +
+	'.xa-product #xbox-accel-device{display:flex;flex-direction:column;gap:8px;max-width:32rem}.xa-product #xbox-accel-device .cbi-dropdown{width:100%;max-width:100%}.xa-product #xbox-accel-device label{overflow-wrap:anywhere}' +
 	'.xa-product .xa-chips input{margin-right:6px}.xa-product .xa-progress{margin:12px 0;padding:12px;background:var(--background-color-low,#f4f6f8);border-radius:6px}' +
 	'.xa-product .xa-card .cbi-section{margin:0;border:0;padding:0}.xa-product [data-widget="CBI.ContainerValue"]{display:block;width:100%;min-width:0;margin:12px 0}' +
 	'.xa-product [data-widget="CBI.ContainerValue"]>.cbi-value-field{margin:0;width:100%}.xa-product [data-widget="CBI.ContainerValue"]>.cbi-value-title{display:none}' +
@@ -87,37 +88,40 @@ function validatePlatformUrl(platform,value,games){
 // 手机浏览器切换网络、转入后台，或路由器瞬时繁忙时，请求会在取得响应前中断；这类失败可以直接重试。
 function interruptedError(err){return /XHR request aborted|No related RPC reply|HTTP error 50[234]/i.test(String(err&&err.message||err||''));}
 function networkError(err){return interruptedError(err)||/XHR request timed out/i.test(String(err&&err.message||err||''));}
-function retryInterrupted(fn,attempts,delay){
+function retryRead(fn,attempts,delay){
 	return Promise.resolve().then(fn).catch(function(err){
-		if(attempts<=1||!interruptedError(err))throw err;
-		return new Promise(function(resolve){setTimeout(resolve,delay);}).then(function(){return retryInterrupted(fn,attempts-1,delay*2);});
+		// 超时最多再读一次；短暂中断继续使用退避重试。
+		if(!interruptedError(err))attempts=Math.min(attempts,2);
+		if(attempts<=1||!networkError(err))throw err;
+		return new Promise(function(resolve){setTimeout(resolve,delay);}).then(function(){return retryRead(fn,attempts-1,delay*2);});
 	});
 }
 
 return view.extend({
 	retryDelay:500,
-	// LuCI 在 load/render 被拒绝后停留在“正在载入视图”；请求中断时先重试，仍失败则渲染可恢复的页面。
+	// 页面先读取配置并渲染，运行状态随后独立更新。
 	load:function(){
 		var delay=this.retryDelay;
-		return Promise.all([
-			// LuCI 的 uci.load 会缓存失败的请求；先卸载，后续重试与“重新加载”才会真正重新读取。
-			retryInterrupted(function(){return uci.load('xbox-accel').catch(function(err){if(uci.unload)uci.unload('xbox-accel');throw err;});},4,delay).then(function(){return null;},function(err){return{load_error:err};}),
-			retryInterrupted(function(){return callStatus();},3,delay).catch(function(err){return{status_error:err.message};})
-		]);
+		// LuCI 的 uci.load 会缓存失败的请求；卸载后重试才会重新发送。
+		return retryRead(function(){return uci.load('xbox-accel').catch(function(err){if(uci.unload)uci.unload('xbox-accel');throw err;});},4,delay)
+			.then(function(){return[null,{status_loading:true}];},function(err){return[{load_error:err},{}];});
 	},
 	render:function(data){
 		var self=this,failure=data&&data[0]&&data[0].load_error;
 		this.loadFailed=false;
 		if(failure)return this.renderLoadFailure(failure);
-		return retryInterrupted(function(){return self.renderView(data);},3,this.retryDelay).catch(function(err){
+		return retryRead(function(){return self.renderView(data);},3,this.retryDelay).catch(function(err){
 			if(!networkError(err))throw err;
 			return self.renderLoadFailure(err);
 		});
 	},
 	renderView:function(data){
 		var self=this;this.statusFailures=0;
+		if(this.statusPoll&&poll.remove)poll.remove(this.statusPoll);
+		this.statusGeneration=(this.statusGeneration||0)+1;this.statusRequest=null;this.applicationLoading=null;
 		this.buttons={};this.actionButtons=[];this.configOptions={};this.groupInputs={};this.resultRows={};this.environmentGroups={};
 		this.activeTab='overview';this.nextStatusPoll=0;this.latestStatus=data[1]||{};
+		this.statusInitialized=typeof this.latestStatus.enabled==='boolean'&&typeof this.latestStatus.running==='boolean';
 		this.lastFinishedTask=this.latestStatus.last_task&&this.latestStatus.last_task.id;
 		this.statusNode=E('table',{'class':'table',id:'xbox-accel-status'});
 		this.featureNode=E('div',{'class':'xa-grid',id:'xbox-accel-features'});
@@ -127,14 +131,11 @@ return view.extend({
 		this.envNode=E('table',{'class':'table',id:'xbox-accel-environment'});
 		this.envNote=E('p',{'class':'xa-muted'});this.logNote=E('p',{'class':'xa-muted'});
 		this.taskDetails=E('div',{id:'xbox-accel-task-details'});this.eventsNode=E('div',{id:'xbox-accel-events'});
-		this.logNode=E('textarea',{id:'xbox-accel-log',readonly:'readonly',wrap:'off',rows:14,style:'width:100%;font-family:monospace;font-size:12px'});
-		this.selectedDevices=[];this.deviceInputs={};this.deviceChoiceKey=null;this.disclosures={};
+		this.logNode=E('textarea',{id:'xbox-accel-log',readonly:'readonly',wrap:'off',rows:14,style:'width:100%;max-height:24rem;resize:vertical;font-family:monospace;font-size:12px'});
+		this.selectedDevices=[];this.deviceNames={};this.deviceDropdown=null;this.deviceChoiceKey=null;this.disclosures={};
 		this.deviceSelection=E('span',{'class':'xa-muted','aria-live':'polite'});
-		this.deviceAll=E('button',{type:'button','class':'btn cbi-button',click:function(){self.selectDevices([]);}},['全部设备']);
-		this.deviceOptions=E('div',{'class':'xa-chips'});
-		this.devicePicker=E('div',{id:'xbox-accel-device',role:'group','aria-label':'下载设备（可多选）'},[
-			E('div',{'class':'xa-actions'},[this.deviceAll,this.deviceSelection]),this.deviceOptions
-		]);
+		this.deviceOptions=E('div',{});
+		this.devicePicker=E('div',{id:'xbox-accel-device'},[this.deviceOptions,this.deviceSelection]);
 		this.recordFilter=E('select',{id:'xbox-accel-record-filter',change:function(){self.updateRecords(self.latestRecords||{});}},[E('option',{value:'all'},['全部事件']),E('option',{value:'errors'},['异常事件'])]);
 		this.button=function(label,command,args,confirmText,predicate){
 			var node=E('button',{'class':'btn cbi-button cbi-button-action',type:'button',click:function(){
@@ -150,7 +151,9 @@ return view.extend({
 		};
 		var linkButton=function(label,tab,group){return E('button',{type:'button','class':'btn cbi-button',click:ui.createHandlerFn(self,function(){if(group)self.selectGroups([group]);self.navigateTab(tab);})},[label]);};
 		var disclosure=function(label,children,id){
-			var node=E('details',{'class':'xa-disclosure',id:id},[E('summary',{},[label])].concat(children));
+			var attrs={'class':'xa-disclosure',id:id};
+			if(id==='xbox-accel-diagnostics')attrs.toggle=function(){return self.loadApplicationReportIfOpen();};
+			var node=E('details',attrs,[E('summary',{},[label])].concat(children));
 			if(id)self.disclosures[id]=node;return node;
 		};
 		var m=this.map=new form.Map('xbox-accel','Xbox 下载加速','选择下载功能，按需测速，在设备下载时查看节点是否生效。');
@@ -168,9 +171,17 @@ return view.extend({
 		var settings,o;
 		panel('overview','_overview',function(){return E('div',{},[
 			self.statusNode,E('div',{'class':'xa-actions'},[linkButton('选择加速功能','functions'),linkButton('按需测速','test'),self.button('检查生效','verify')]),self.featureNode,
-			E('h3',{},['真实下载状态']),E('p',{'class':'xa-muted'},['开始设备下载后，自动观察实际连接与当前节点的匹配情况。默认展示全部设备，可勾选多台设备一起查看。']),
-			E('p',{},['下载设备（可多选）']),self.devicePicker,self.downloadNode
+			E('h3',{},['真实下载状态']),E('p',{'class':'xa-muted'},['开始设备下载后，自动观察实际连接与当前节点的匹配情况。默认展示全部设备，可选择多台设备一起查看。'])
 		]);});
+		o=s.taboption('overview',form.MultiValue,'download_devices','下载设备（可多选）','筛选下载状态；清空选择显示全部设备，设备选择随配置保存。');
+		o.default=[];o.rmempty=true;
+		o.renderWidget=function(section_id,option_index,cfgvalue){
+			self.deviceOption=this;self.deviceWidgetId=this.cbid(section_id);
+			self.deviceDropdown=null;self.deviceChoiceKey=null;
+			self.selectDevices([].concat((cfgvalue!=null?cfgvalue:this.cfgvalue(section_id))||[]));
+			return self.devicePicker;
+		};
+		panel('overview','_downloads',function(){return self.downloadNode;});
 		settings=section('functions','_basic','加速服务',false);
 		flag(settings,'enabled','启动加速','0','按已选择的功能应用下载节点。');
 		o=option(settings,form.ListValue,'isp','运营商');
@@ -266,31 +277,60 @@ return view.extend({
 		});
 		panel('test','_reset_results',function(){return disclosure('运行节点维护',[self.button('清除当前运行节点','reset',null,'清除后下载使用默认解析，测速历史保留。继续清除？')]);});
 		panel('records','_records',function(){return E('div',{},[
-			E('div',{'class':'xa-actions'},[self.recordFilter,E('button',{type:'button','class':'btn',click:ui.createHandlerFn(self,'loadRecords')},['刷新记录']),self.button('导出诊断报告','export')]),self.recordProgressNode,self.eventsNode,self.taskDetails,
+			E('div',{'class':'xa-actions',id:'xbox-accel-record-actions'},[
+				E('button',{type:'button','class':'btn',click:ui.createHandlerFn(self,'loadRecords')},['刷新记录']),self.button('导出诊断报告','export'),
+				self.button('重新应用配置','apply'),self.button('重启服务','restart'),self.button('清空事件与日志','clear_log',null,'清空日常事件、异常事件和原始日志，任务及验收历史保留。继续清空？')
+			]),self.recordProgressNode,
+			E('div',{id:'xbox-accel-raw-log'},[E('h3',{},['运行日志']),self.logNote,self.logNode]),
 			disclosure('验收与环境详情',[self.envNote,self.envNode,E('div',{'class':'xa-actions'},[self.button('重新检查生效','verify'),E('button',{type:'button','class':'btn',click:ui.createHandlerFn(self,'loadApplicationReport')},['查看最近验收']),E('button',{type:'button','class':'btn',click:ui.createHandlerFn(self,'refreshEnvironment')},['环境初查'])])],'xbox-accel-diagnostics'),
-			disclosure('原始日志',[self.logNote,self.logNode],'xbox-accel-raw-log'),
-			disclosure('维护操作',[E('div',{'class':'xa-actions'},[self.button('重新应用配置','apply'),self.button('重启服务','restart'),self.button('清空事件与日志','clear_log',null,'清空日常事件、异常事件和原始日志，任务及验收历史保留。继续清空？')])])
+			E('h3',{},['运行事件']),self.recordFilter,self.eventsNode,self.taskDetails
 		]);});
 		settings=section('records','_logging','日志采集设置',true);
 		o=option(settings,form.ListValue,'log_mode','采集内容','日常事件自动保留，详细模式增加逐节点和逐域名诊断。');o.value('concise','日常摘要');o.value('detail','详细诊断');o.default='concise';o.rmempty=false;
 		return m.render().then(function(formNode){
 			self.formNode=formNode;
 			var page=E('div',{'class':'xa-product'},[E('style',{},[CSS]),formNode]);
-			if(formNode.querySelectorAll)formNode.querySelectorAll('.cbi-tabmenu a').forEach(function(a){a.addEventListener('click',function(){self.activeTab=a.parentElement.getAttribute('data-tab');self.nextStatusPoll=0;if(self.activeTab==='records')self.loadRecords();});});
+			if(formNode.querySelectorAll)formNode.querySelectorAll('.cbi-tabmenu a').forEach(function(a){a.addEventListener('click',function(){
+				self.activeTab=a.parentElement.getAttribute('data-tab');self.nextStatusPoll=0;
+				if(self.activeTab==='records'){
+					self.loadRecords();self.loadApplicationReportIfOpen();
+					requestAnimationFrame(function(){if(self.activeTab==='records')self.logNode.scrollTop=self.logNode.scrollHeight;});
+				}
+			});});
 			self.updateStatus(data[1]||{});self.updateRecords({});self.updateEnvironment({});
-			poll.add(function(){if(Date.now()<self.nextStatusPoll)return Promise.resolve();return callStatus().then(function(status){self.statusFailures=0;self.updateStatus(status);if(self.activeTab==='records')return self.loadRecords();}).catch(function(err){
-				// 单次请求中断时保留上次状态，下个周期重读；连续中断再提示并锁定操作。
-				self.statusFailures=(self.statusFailures||0)+1;
-				if(interruptedError(err)&&self.statusFailures<3)return;
-				self.updateStatus({status_error:err.message});
-			});},5);
-			if(self.latestStatus.last_application&&self.latestStatus.last_application.available)self.loadApplicationReport();
+			self.statusPoll=function(){if(self.loadFailed||Date.now()<self.nextStatusPoll)return Promise.resolve();return self.loadStatus();};
+			poll.add(self.statusPoll,5);
+			if(data[1]&&data[1].status_loading)self.loadStatus();
 			return page;
 		});
+	},
+	loadStatus:function(){
+		if(this.statusRequest)return this.statusRequest;
+		var self=this,generation=this.statusGeneration;
+		this.statusRequest=callStatus().then(function(status){
+			if(generation!==self.statusGeneration)return;
+			var initializing=false;
+			// 首次取得的已完成任务属于历史状态，后续更新再处理新任务完成事件。
+			if(!self.statusInitialized&&typeof status.enabled==='boolean'&&typeof status.running==='boolean'){
+				self.statusInitialized=true;self.lastFinishedTask=status.last_task&&status.last_task.id;initializing=true;
+			}
+			self.statusFailures=0;self.updateStatus(status);
+			if(initializing)self.loadApplicationReportIfOpen();
+			if(self.activeTab==='records')self.loadRecords();
+		}).catch(function(err){
+			if(generation!==self.statusGeneration)return;
+			self.statusFailures=(self.statusFailures||0)+1;
+			// 有有效状态时保留一次或两次短暂失败的结果，轮询继续恢复。
+			if(networkError(err)&&self.statusValid&&self.statusFailures<3)return;
+			self.updateStatus({status_error:err.message});
+		}).finally(function(){if(generation===self.statusGeneration)self.statusRequest=null;});
+		return this.statusRequest;
 	},
 	// 载入阶段的请求中断后给出可恢复的页面，原地重新读取配置与状态。
 	renderLoadFailure:function(err){
 		var self=this,message=E('p',{'class':'xa-warn'},[String(err&&err.message||err||'未知错误')]);
+		if(this.statusPoll&&poll.remove)poll.remove(this.statusPoll);
+		this.statusGeneration=(this.statusGeneration||0)+1;this.statusRequest=null;
 		var button=E('button',{'class':'btn cbi-button cbi-button-action',type:'button',id:'xbox-accel-reload',click:function(){
 			if(button.disabled)return Promise.resolve();
 			button.disabled=true;if(button.classList)button.classList.add('spinning');
@@ -301,8 +341,8 @@ return view.extend({
 		}},['重新加载']);
 		this.loadFailed=true;
 		return E('div',{'class':'xa-product'},[E('style',{},[CSS]),E('div',{'class':'xa-card',id:'xbox-accel-load-error'},[
-			E('h4',{},['页面数据读取中断']),message,
-			E('p',{'class':'xa-muted'},['已自动重试。手机切换网络、浏览器转入后台或路由器繁忙时会出现这种情况；页面读取失败不影响已应用的加速配置。']),
+			E('h4',{},['页面配置暂时读取失败']),message,
+			E('p',{'class':'xa-muted'},['已完成自动重试。请保持与路由器的连接，再点击“重新加载”。已保存的加速配置继续生效。']),
 			E('div',{'class':'xa-actions'},[button])
 		])]);
 	},
@@ -319,43 +359,47 @@ return view.extend({
 	selectedGroups:function(){var self=this;return PLATFORMS.filter(function(p){return self.groupInputs[p.id]&&self.groupInputs[p.id].checked;}).map(function(p){return p.id;});},
 	selectGroups:function(groups){var self=this;PLATFORMS.forEach(function(p){if(self.groupInputs[p.id])self.groupInputs[p.id].checked=groups.indexOf(p.id)!==-1;});},
 	selectDevices:function(devices){
-		this.selectedDevices=devices;
+		this.selectedDevices=[].concat(devices||[]).filter(function(ip,index,list){return ip&&list.indexOf(ip)===index;});
+		if(this.deviceDropdown){
+			var current=this.deviceDropdown.getValue(),selected=this.selectedDevices;
+			if(current.length!==selected.length||current.some(function(ip){return selected.indexOf(ip)===-1;}))this.deviceDropdown.setValue(selected);
+		}
 		if(this.statusValid)this.updateStatus(this.latestStatus);
 		else this.updateDevicePicker((this.latestStatus.observation||{}).devices||[]);
 	},
 	updateDevicePicker:function(devices){
-		var self=this,seen={},choices=[];
+		var self=this,seen={},choices=[],labels={},nodes={};
 		devices.forEach(function(device){if(device.ip&&!seen[device.ip]){seen[device.ip]=true;choices.push(device);}});
 		this.selectedDevices.forEach(function(ip){if(!seen[ip]){seen[ip]=true;choices.push({ip:ip,pending:true});}});
-		var labels=choices.map(function(device){
-			var item=self.deviceInputs[device.ip];
-			if(!item){
-				var input=E('input',{type:'checkbox',value:device.ip,change:function(){
-					var selected=self.selectedDevices.filter(function(ip){return ip!==device.ip;});
-					if(this.checked)selected.push(device.ip);
-					self.selectDevices(selected);
-				}}),label=E('span',{});
-				item=self.deviceInputs[device.ip]={input:input,label:label,node:E('label',{},[input,label])};
-			}
-			item.name=device.name||item.name||device.ip;
-			item.input.checked=self.selectedDevices.indexOf(device.ip)!==-1;
-			item.label.textContent=(item.name===device.ip?device.ip:item.name+'（'+device.ip+'）')+(device.pending?' · 等待观测':'');
-			return item.node;
+		choices.forEach(function(device){
+			var name=self.deviceNames[device.ip]=device.name||self.deviceNames[device.ip]||device.ip;
+			labels[device.ip]=(name===device.ip?device.ip:name+'（'+device.ip+'）')+(device.pending?' · 等待观测':'');
+			nodes[device.ip]=E('span',{},[labels[device.ip]]);
 		});
-		var key=choices.map(function(device){return device.ip;}).join(',');
-		if(this.deviceChoiceKey!==key){dom.content(this.deviceOptions,labels);this.deviceChoiceKey=key;}
-		Object.keys(this.deviceInputs).forEach(function(ip){if(!seen[ip])delete self.deviceInputs[ip];});
-		this.deviceAll.disabled=this.selectedDevices.length===0;
+		var key=JSON.stringify(labels);
+		if(this.deviceWidgetId&&this.deviceChoiceKey!==key){
+			var opened=this.deviceDropdown&&this.deviceDropdown.node.hasAttribute('open');
+			this.deviceDropdown=new ui.Dropdown(this.selectedDevices.slice(),nodes,{
+				id:this.deviceWidgetId,multiple:true,optional:true,sort:Object.keys(labels),
+				select_placeholder:'全部设备',display_items:2,dropdown_items:8,
+				validate:this.deviceOption.getValidator('main'),disabled:!!this.map.readonly
+			});
+			var node=this.deviceDropdown.render();
+			node.addEventListener('cbi-dropdown-change',function(){self.selectDevices(self.deviceDropdown.getValue());});
+			dom.content(this.deviceOptions,[node]);this.deviceChoiceKey=key;
+			if(opened)this.deviceDropdown.openDropdown(node);
+		}
 		this.deviceSelection.textContent=this.selectedDevices.length?'已选择 '+this.selectedDevices.length+' 台设备':'当前显示全部设备';
 	},
 	updateStatus:function(status){
 		var self=this,invalid=!!status.status_error||typeof status.enabled!=='boolean'||typeof status.running!=='boolean',task=status.last_task,busy=busyTask(status),application=status.last_application;
 		if(invalid){
+			var loading=!!status.status_loading,style=loading?'xa-muted':'xa-warn';
 			this.statusValid=false;
-			dom.content(this.statusNode,[E('tr',{'class':'tr'},[E('td',{'class':'td xa-warn'},['状态读取失败：'+(status.status_error||'响应格式异常')])])]);
-			dom.content(this.featureNode,[E('p',{'class':'xa-warn'},['功能状态等待重新读取，最近验收与日志保留在运行记录。'])]);
-			dom.content(this.downloadNode,[E('p',{'class':'xa-warn'},['下载观测暂停更新，请等待状态恢复。'])]);
-			this.recordProgressNode.hidden=false;dom.content(this.recordProgressNode,[E('p',{},['状态读取等待恢复，最近记录保留。'])]);
+			dom.content(this.statusNode,[E('tr',{'class':'tr'},[E('td',{'class':'td '+style},[loading?'正在读取运行状态…':'状态读取失败：'+(status.status_error||'响应格式异常')])])]);
+			dom.content(this.featureNode,[E('p',{'class':style},[loading?'功能状态正在读取。':'功能状态等待重新读取，最近验收与日志保留在运行记录。'])]);
+			dom.content(this.downloadNode,[E('p',{'class':style},[loading?'下载观测正在读取。':'下载观测暂停更新，请等待状态恢复。'])]);
+			this.recordProgressNode.hidden=loading;dom.content(this.recordProgressNode,[E('p',{},['状态读取等待恢复，最近记录保留。'])]);
 			this.actionButtons.forEach(function(button){button.node.disabled=true;});this.nextStatusPoll=Date.now()+5000;return;
 		}
 		this.statusValid=true;
@@ -388,7 +432,7 @@ return view.extend({
 		this.nextStatusPoll=Date.now()+((busy||(status.enabled&&this.activeTab==='overview')||(status.enabled&&!status.running))?5000:30000);
 		if(task&&['queued','running','none'].indexOf(task.status)===-1&&task.id!==this.lastFinishedTask){
 			this.lastFinishedTask=task.id;this.loadRecords();
-			if(application&&application.available&&application.checked_at>=task.started_at)this.loadApplicationReport();
+			if(application&&application.available&&application.checked_at>=task.started_at)this.loadApplicationReportIfOpen();
 			if(task.kind==='adopt')this.refreshAdoptedConfiguration();
 		}
 		if(this.pendingExport&&task&&task.id===this.pendingExport&&['queued','running'].indexOf(task.status)===-1){this.pendingExport=null;if(task.code==='REPORT_READY'&&status.report_ready)this.downloadReport();else ui.addNotification(null,E('p',{},['诊断报告生成失败，详情见运行记录。']),'error');}
@@ -532,13 +576,23 @@ return view.extend({
 		});
 	},
 
+	loadApplicationReportIfOpen: function() {
+		var details=this.disclosures&&this.disclosures['xbox-accel-diagnostics'],application=(this.latestStatus||{}).last_application;
+		if(this.activeTab==='records'&&details&&details.open&&application&&application.available)return this.loadApplicationReport();
+		return Promise.resolve();
+	},
+
 	loadApplicationReport: function() {
-		var self=this;
-		return fs.read_direct('/tmp/xbox-accel/last-application.json','blob').then(function(blob){return blob.text();}).then(function(text){
+		if(this.applicationLoading)return this.applicationLoading;
+		var self=this,generation=this.statusGeneration;
+		this.applicationLoading=fs.read_direct('/tmp/xbox-accel/last-application.json','blob').then(function(blob){return blob.text();}).then(function(text){
+			if(generation!==self.statusGeneration)return;
 			var report=JSON.parse(text);
 			self.updateEnvironment(report);
 			self.envNote.textContent='完整验收记录于 '+formatTime(report.checked_at)+'；实时下载连接见总览，速度效果需同资源对比。';
-		}).catch(function(err){self.envNote.textContent='无法读取完整报告：'+err.message+'；请重新验收。';});
+		}).catch(function(err){if(generation===self.statusGeneration)self.envNote.textContent='无法读取完整报告：'+err.message+'；请重新验收。';})
+			.finally(function(){if(generation===self.statusGeneration)self.applicationLoading=null;});
+		return this.applicationLoading;
 	},
 
 	downloadReport: function() {

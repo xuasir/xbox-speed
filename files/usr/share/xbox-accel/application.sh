@@ -8,39 +8,45 @@ application_report_document() {
 }
 
 append_application_summary() {
-    local old="${JSON_PREFIX:-}" document checked signature status router measurement direct_set traffic clients passed failed unknown warnings stale=1
+    local old="${JSON_PREFIX:-}" document summary checked signature current_signature now age same=0 status router measurement direct_set traffic clients passed failed unknown warnings stale=1
     if [ ! -s "$TMP_DIR/last-application.json" ] && [ -s "$STATE_DIR/last-application.json" ]; then
         mkdir -p "$TMP_DIR"
         cp "$STATE_DIR/last-application.json" "$TMP_DIR/last-application.json" 2>/dev/null || true
     fi
     document=$(application_report_document)
+    # 状态页只读取摘要；完整验收条目留在报告中，按需查看。
+    checked=$(printf '%s' "$document" | jsonfilter -e '@.checked_at' 2>/dev/null)
+    signature=$(printf '%s' "$document" | jsonfilter -e '@.configuration_signature' 2>/dev/null)
+    summary=$(printf '%s' "$document" | jsonfilter -e '@.summary' 2>/dev/null)
+    [ -n "$summary" ] || summary='{}'
     . /usr/share/libubox/jshn.sh
     json_set_namespace XA_APPLICATION_META_
-    if jshn -r "$document" >/dev/null 2>&1 && json_load "$document" 2>/dev/null; then
-        json_get_var checked checked_at; json_get_var signature configuration_signature
-        if json_select summary >/dev/null 2>&1; then
-            json_get_var status router; json_get_var passed passed; json_get_var failed failed
-            json_get_var unknown unknown; json_get_var warnings warnings
-            json_get_var measurement measurement; json_get_var direct_set direct_set
-            json_get_var traffic traffic; json_get_var clients clients
-            json_select ..
-        fi
+    if json_load "$summary" 2>/dev/null; then
+        json_get_var status router; json_get_var passed passed; json_get_var failed failed
+        json_get_var unknown unknown; json_get_var warnings warnings
+        json_get_var measurement measurement; json_get_var direct_set direct_set
+        json_get_var traffic traffic; json_get_var clients clients
     fi
     router=${status:-none}
     if [ "$status" = verified ]; then
         if [ "$measurement" = failed ] || [ "$direct_set" = failed ]; then status=failed;
         elif [ "$measurement" = unknown ] || [ "$direct_set" = unknown ]; then status=partial; fi
     fi
-    if [ -n "$signature" ] && [ "$signature" = "$(configuration_signature)" ] && [ $(($(date +%s) - $(to_int "$checked"))) -ge 0 ] && [ $(($(date +%s) - $(to_int "$checked"))) -lt 60 ]; then stale=0; fi
+    if [ -n "$signature" ]; then
+        current_signature=$(configuration_signature)
+        if [ "$signature" = "$current_signature" ]; then same=1; fi
+    fi
+    now=$(date +%s); age=$((now-$(to_int "$checked")))
+    if [ "$same" = 1 ] && [ "$age" -ge 0 ] && [ "$age" -lt 60 ]; then stale=0; fi
     json_set_namespace "$old"
     json_add_object last_application
     json_add_string status "${status:-none}"; json_add_int checked_at "$(to_int "$checked")"
     json_add_string router "$router"; json_add_string measurement "${measurement:-skipped}"; json_add_string direct_set "${direct_set:-skipped}"
     json_add_string traffic "${traffic:-unknown}"; json_add_string clients "${clients:-unknown}"
     json_add_boolean stale "$stale"; json_add_boolean available "$([ -s "$TMP_DIR/last-application.json" ] && echo 1 || echo 0)"
-    json_add_boolean same_configuration "$( [ -n "$signature" ] && [ "$signature" = "$(configuration_signature)" ] && echo 1 || echo 0 )"
+    json_add_boolean same_configuration "$same"
     json_set_namespace XA_APPLICATION_META_
-    if json_select summary >/dev/null 2>&1 && json_select groups >/dev/null 2>&1; then
+    if json_select groups >/dev/null 2>&1; then
         json_set_namespace "$old"
         json_add_object groups; json_copy_current XA_APPLICATION_META_ "$old"; json_close_object
     fi

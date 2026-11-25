@@ -117,6 +117,7 @@ need "curl" "command -v curl" curl
 need "下载连接观测" "command -v conntrack" conntrack
 need "HTTPS CA 证书" "test -s /etc/ssl/certs/ca-certificates.crt" ca-bundle
 need "jshn" "test -f /usr/share/libubox/jshn.sh" jshn
+need "jsonfilter" "command -v jsonfilter" jsonfilter
 need "rpcd" "test -x /sbin/rpcd" rpcd
 need "LuCI" "test -f /www/luci-static/resources/luci.js" luci-base
 if [ -x /usr/sbin/uhttpd ]; then

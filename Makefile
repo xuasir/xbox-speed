@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-xbox-accel
-PKG_VERSION:=0.3.0
+PKG_VERSION:=0.3.3
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKGARCH:=all
@@ -13,7 +13,7 @@ define Package/luci-app-xbox-accel
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Game download CDN optimization and Xbox HTTP redirect
-  DEPENDS:=+luci-base +rpcd +curl +ca-bundle +uhttpd +jshn +conntrack
+  DEPENDS:=+luci-base +rpcd +curl +ca-bundle +uhttpd +jshn +jsonfilter +conntrack
 endef
 
 define Package/luci-app-xbox-accel/description

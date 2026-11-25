@@ -3,7 +3,8 @@
 
 observation_signature() {
     {
-        uci -q export xbox-accel
+        # 页面筛选项随配置保存，连接观测只比较业务设置。
+        uci -q export xbox-accel | sed -e '/^[[:space:]]*list download_devices /d' -e '/^[[:space:]]*option download_devices /d'
         cat "$RESOLVER_CONF" "$REDIRECT_CONF" /proc/sys/kernel/random/boot_id 2>/dev/null
         for group in $ALL_GROUPS; do cat "$STATE_DIR/best_$group" "$STATE_DIR/domains_$group" 2>/dev/null; done
     } | {

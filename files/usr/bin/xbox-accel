@@ -3,7 +3,7 @@
 # 结构：主 dnsmasq 只写固定规则，把 Xbox 下载域名交给本插件的解析实例；
 #       换节点、切模式只改解析实例的配置，不动主 dnsmasq。
 
-VERSION=0.3.0
+VERSION=0.3.3
 NAME=xbox-accel
 STATE_DIR=/etc/xbox-accel
 RUN_DIR=/var/run/xbox-accel
@@ -1428,9 +1428,18 @@ in_passwall_direct() {
 
 # ---------- LuCI / rpcd ----------
 
-json_status() {
+json_status() (
+	# 在本次状态读取中复用同一份配置快照，统一读取所有设置。
+	. /lib/functions.sh
+	if config_load "$NAME"; then
+		cfg() {
+			local value
+			config_get value main "$1"
+			if [ -n "$value" ]; then printf '%s\n' "$value"; else printf '%s\n' "$2"; fi
+		}
+	fi
 	. /usr/share/libubox/jshn.sh
-	local g last d configured verified game_status mapped defaults total domains
+	local g last d configured verified game_status mapped defaults total domains document observation
 	json_init
 	json_add_string version "$VERSION"
 	json_add_string log_mode "$LOG_MODE"
@@ -1492,11 +1501,13 @@ json_status() {
 	json_append_document last_test "$(last_speed_document)" 1
 	append_measurements
 	append_application_summary
-	json_append_document observation "$(observation_document)"
+	# 观测函数已输出完整 JSON，直接组合到响应中。
+	observation=$(observation_document) || return 1
 	json_add_boolean report_ready "$(report_available && echo 1 || echo 0)"
 	json_add_string report_file "$REPORT_FILE"
-	json_dump
-}
+	document=$(json_dump) || return 1
+	printf '%s,"observation":%s}\n' "${document%\}}" "$observation"
+)
 
 env_row() { # 名称 级别（ok|info|warn|fail） 说明
 	json_add_object ""
